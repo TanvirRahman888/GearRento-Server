@@ -18,6 +18,7 @@ const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL;
 const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL?.replace(/\/+$/, "");
 
+
 if (!CLIENT_URL || !BETTER_AUTH_URL || !process.env.MONGODB_URI) {
   throw new Error(
     "Missing CLIENT_URL, BETTER_AUTH_URL, or MONGODB_URI in .env",
@@ -59,7 +60,9 @@ const db = client.db(process.env.DB_NAME || "GearRento");
 const jwksURL = new URL(`${BETTER_AUTH_URL}/api/auth/jwks`);
 
 // Cache the JWKS verifier
-const JWKS = createRemoteJWKSet(jwksURL);
+const JWKS = createRemoteJWKSet(
+  new URL(`${BETTER_AUTH_URL}/api/auth/jwks`)
+);
 
 // ======================================
 // JWT Authentication Middleware
