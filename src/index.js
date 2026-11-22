@@ -401,6 +401,7 @@ async function startServer() {
       .createIndex({ userId: 1 }, { unique: true });
 
     await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
+    await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
 
     console.log("MongoDB connected successfully");
 
@@ -483,7 +484,6 @@ app.get(
   },
 );
 
-
 // ======================================
 // Shared Equipment Helpers
 // ======================================
@@ -550,9 +550,7 @@ app.get(
     }
 
     try {
-      const equipment = await db
-        .collection("equipment")
-        .findOne(filter);
+      const equipment = await db.collection("equipment").findOne(filter);
 
       if (!equipment) {
         return res.status(404).json({
@@ -562,7 +560,7 @@ app.get(
 
       // Sanitize again before rendering as HTML
       const cleanDescription = cleanEquipmentDescription(
-        equipment.descriptionHtml || ""
+        equipment.descriptionHtml || "",
       );
 
       return res.status(200).json({
@@ -571,9 +569,7 @@ app.get(
           ...equipment,
           _id: equipment._id.toString(),
           descriptionHtml: cleanDescription,
-          descriptionText: getPlainDescription(
-            cleanDescription
-          ),
+          descriptionText: getPlainDescription(cleanDescription),
         },
       });
     } catch (error) {
@@ -583,7 +579,7 @@ app.get(
         error: "Unable to load equipment details.",
       });
     }
-  }
+  },
 );
 
 // ======================================
@@ -620,36 +616,25 @@ app.patch(
       typeof name === "string" &&
       name.trim().length >= 3 &&
       name.trim().length <= 120 &&
-
       Array.isArray(categories) &&
       categories.length >= 1 &&
       categories.length <= allowedCategories.length &&
-      categories.every((item) =>
-        allowedCategories.includes(item)
-      ) &&
-
+      categories.every((item) => allowedCategories.includes(item)) &&
       allowedConditions.includes(condition) &&
-
       Array.isArray(divisions) &&
       divisions.length >= 1 &&
       divisions.length <= allowedDivisions.length &&
-      divisions.every((item) =>
-        allowedDivisions.includes(item)
-      ) &&
-
+      divisions.every((item) => allowedDivisions.includes(item)) &&
       Array.isArray(imageUrls) &&
       imageUrls.length >= 1 &&
       imageUrls.length <= 5 &&
       imageUrls.every(validImageUrl) &&
-
       typeof descriptionHtml === "string" &&
       descriptionHtml.length <= 12000 &&
-
       typeof dailyPrice === "number" &&
       Number.isFinite(dailyPrice) &&
       dailyPrice > 0 &&
       dailyPrice <= 1000000 &&
-
       Number.isInteger(quantity) &&
       quantity >= 1 &&
       quantity <= 10000;
@@ -660,43 +645,36 @@ app.patch(
       });
     }
 
-    const cleanDescription =
-      cleanEquipmentDescription(descriptionHtml);
+    const cleanDescription = cleanEquipmentDescription(descriptionHtml);
 
-    const descriptionText =
-      getPlainDescription(cleanDescription);
+    const descriptionText = getPlainDescription(cleanDescription);
 
-    if (
-      descriptionText.length < 20 ||
-      descriptionText.length > 3000
-    ) {
+    if (descriptionText.length < 20 || descriptionText.length > 3000) {
       return res.status(400).json({
         error: "Description must contain 20–3000 characters.",
       });
     }
 
     try {
-      const result = await db
-        .collection("equipment")
-        .updateOne(filter, {
-          $set: {
-            name: name.trim(),
-            categories: [...new Set(categories)],
-            condition,
-            divisions: [...new Set(divisions)],
-            descriptionHtml: cleanDescription,
-            imageUrls: imageUrls.map((url) => url.trim()),
-            dailyPrice,
-            quantity,
+      const result = await db.collection("equipment").updateOne(filter, {
+        $set: {
+          name: name.trim(),
+          categories: [...new Set(categories)],
+          condition,
+          divisions: [...new Set(divisions)],
+          descriptionHtml: cleanDescription,
+          imageUrls: imageUrls.map((url) => url.trim()),
+          dailyPrice,
+          quantity,
 
-            // Safe only while there are no active bookings
-            availableQuantity: quantity,
+          // Safe only while there are no active bookings
+          availableQuantity: quantity,
 
-            // Require fresh approval after changes
-            status: "pending",
-            updatedAt: new Date(),
-          },
-        });
+          // Require fresh approval after changes
+          status: "pending",
+          updatedAt: new Date(),
+        },
+      });
 
       if (result.matchedCount === 0) {
         return res.status(404).json({
@@ -715,7 +693,7 @@ app.patch(
         error: "Unable to update equipment.",
       });
     }
-  }
+  },
 );
 
 // ======================================
@@ -737,9 +715,7 @@ app.delete(
     }
 
     try {
-      const result = await db
-        .collection("equipment")
-        .deleteOne(filter);
+      const result = await db.collection("equipment").deleteOne(filter);
 
       if (result.deletedCount === 0) {
         return res.status(404).json({
@@ -758,8 +734,164 @@ app.delete(
         error: "Unable to delete equipment.",
       });
     }
-  }
+  },
 );
 
+// ======================================
+// ADMIN: Get Pending Equipment
+// GET /equipment/pending
+// ======================================
+
+app.get(
+  "/equipment/pending",
+  verifyJWT,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const requestedPage = Number(req.query.page ?? 1);
+      const page =
+        Number.isSafeInteger(requestedPage) && requestedPage >= 1
+          ? requestedPage
+          : 1;
+
+      const limit = 10;
+      const filter = { status: "pending" };
+      const collection = db.collection("equipment");
+
+      const [total, documents] = await Promise.all([
+        collection.countDocuments(filter),
+        collection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+      ]);
+
+      const equipment = documents.map((item) => ({
+        _id: item._id.toString(),
+        name: item.name,
+        categories: item.categories,
+        divisions: item.divisions,
+        condition: item.condition,
+        dailyPrice: item.dailyPrice,
+        quantity: item.quantity,
+        imageUrls: item.imageUrls,
+        ownerId: item.ownerId,
+        status: item.status,
+        createdAt: item.createdAt,
+
+        // Send plain text to the Admin UI
+        descriptionText: sanitizeHtml(item.descriptionHtml || "", {
+          allowedTags: [],
+          allowedAttributes: {},
+        }).trim(),
+      }));
+
+      return res.json({
+        success: true,
+        equipment,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      console.error("Pending equipment error:", error);
+
+      return res.status(500).json({
+        error: "Unable to load pending equipment.",
+      });
+    }
+  },
+);
+
+// ======================================
+// ADMIN: Approve or Reject Equipment
+// PATCH /equipment/review/:id
+// ======================================
+
+app.patch(
+  "/equipment/review/:id",
+  verifyJWT,
+  requireRole("admin"),
+  async (req, res) => {
+    const { id } = req.params;
+    const { decision, reason } = req.body ?? {};
+
+    // Validate MongoDB ObjectId
+    if (!/^[a-f0-9]{24}$/i.test(id)) {
+      return res.status(400).json({
+        error: "Invalid equipment ID.",
+      });
+    }
+
+    if (decision !== "approve" && decision !== "reject") {
+      return res.status(400).json({
+        error: "Invalid review decision.",
+      });
+    }
+
+    const reviewReason = typeof reason === "string" ? reason.trim() : "";
+
+    // Rejection needs an explanation
+    if (
+      decision === "reject" &&
+      (reviewReason.length < 5 || reviewReason.length > 500)
+    ) {
+      return res.status(400).json({
+        error: "Provide a rejection reason of 5–500 characters.",
+      });
+    }
+
+    try {
+      const result = await db.collection("equipment").updateOne(
+        {
+          _id: new ObjectId(id),
+          status: "pending",
+        },
+        {
+          $set: {
+            status: decision === "approve" ? "approved" : "rejected",
+
+            reviewReason: decision === "reject" ? reviewReason : "",
+
+            reviewedBy: req.authUser.id,
+            reviewedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        const exists = await db
+          .collection("equipment")
+          .findOne({ _id: new ObjectId(id) });
+
+        return res.status(exists ? 409 : 404).json({
+          error: exists
+            ? "This listing is no longer pending review."
+            : "Equipment not found.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          decision === "approve"
+            ? "Equipment approved successfully."
+            : "Equipment rejected successfully.",
+      });
+    } catch (error) {
+      console.error("Equipment review error:", error);
+
+      return res.status(500).json({
+        error: "Unable to review equipment.",
+      });
+    }
+  },
+);
 
 startServer();
