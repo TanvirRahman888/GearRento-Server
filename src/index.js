@@ -415,8 +415,7 @@ async function startServer() {
 
     console.log("MongoDB connected successfully");
 
-
-// stripeBookingDb############
+    // stripeBookingDb############
 
     stripeBookingDb = db;
 
@@ -452,6 +451,13 @@ async function startServer() {
         },
       },
     );
+
+    await db.collection("bookings").createIndex({
+      ownerId: 1,
+      paymentStatus: 1,
+      status: 1,
+      createdAt: -1,
+    });
 
     app.listen(PORT, () => {
       console.log(`GearRento server running on port ${PORT}`);

@@ -781,4 +781,212 @@ export function registerBookingRoutes(
       }
     },
   );
+
+
+// ==========================================
+// GET /bookings/owner
+// Owner: View paid rental bookings
+// ==========================================
+
+app.get(
+  "/bookings/owner",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    try {
+      const requestedPage = Number(req.query.page || 1);
+
+      const page =
+        Number.isSafeInteger(requestedPage) &&
+        requestedPage >= 1
+          ? Math.min(requestedPage, 100000)
+          : 1;
+
+      const requestedStatus =
+        typeof req.query.status === "string"
+          ? req.query.status
+          : "all";
+
+      const status = [
+        "all",
+        "confirmed",
+        "completed",
+      ].includes(requestedStatus)
+        ? requestedStatus
+        : "all";
+
+      const limit = 10;
+
+      // IMPORTANT: Owner ID comes from JWT,
+      // never from request query parameters.
+      const baseFilter = {
+        ownerId: req.authUser.id,
+        paymentStatus: "paid",
+      };
+
+      const filter = {
+        ...baseFilter,
+        status:
+          status === "all"
+            ? { $in: ["confirmed", "completed"] }
+            : status,
+      };
+
+      const collection = getDb().collection("bookings");
+
+      const [
+        total,
+        confirmedCount,
+        completedCount,
+        bookings,
+      ] = await Promise.all([
+        collection.countDocuments(filter),
+
+        collection.countDocuments({
+          ...baseFilter,
+          status: "confirmed",
+        }),
+
+        collection.countDocuments({
+          ...baseFilter,
+          status: "completed",
+        }),
+
+        collection
+          .find(filter, {
+            projection: {
+              equipmentId: 1,
+              equipmentName: 1,
+              imageUrl: 1,
+
+              customerId: 1,
+              fullName: 1,
+              phone: 1,
+              division: 1,
+              district: 1,
+              address: 1,
+              notes: 1,
+
+              startDate: 1,
+              endDate: 1,
+              totalDays: 1,
+              quantity: 1,
+
+              dailyPrice: 1,
+              totalPrice: 1,
+              currency: 1,
+
+              status: 1,
+              paymentStatus: 1,
+              createdAt: 1,
+              completedAt: 1,
+            },
+          })
+          .sort({ createdAt: -1, _id: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+
+        bookings: bookings.map((booking) => ({
+          ...booking,
+          _id: booking._id.toString(),
+          equipmentId: booking.equipmentId.toString(),
+        })),
+
+        stats: {
+          total: confirmedCount + completedCount,
+          confirmed: confirmedCount,
+          completed: completedCount,
+        },
+
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      console.error("Owner rentals error:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "Unable to load rental bookings.",
+      });
+    }
+  }
+);
+
+// ==========================================
+// PATCH /bookings/owner/:id/complete
+// Owner: Mark a returned rental completed
+// ==========================================
+
+app.patch(
+  "/bookings/owner/:id/complete",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!/^[a-f0-9]{24}$/i.test(id)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid booking ID.",
+        });
+      }
+
+      const today = todayInBangladesh();
+
+      // Atomic conditional update:
+      // - correct Owner
+      // - confirmed and paid booking
+      // - rental period already ended
+      const result = await getDb()
+        .collection("bookings")
+        .updateOne(
+          {
+            _id: new ObjectId(id),
+            ownerId: req.authUser.id,
+            status: "confirmed",
+            paymentStatus: "paid",
+            endDate: { $lt: today },
+          },
+          {
+            $set: {
+              status: "completed",
+              completedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+      if (result.matchedCount === 0) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "Booking not eligible for completion. Check ownership, payment status, and rental end date.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Rental marked as completed.",
+      });
+    } catch (error) {
+      console.error("Complete rental error:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "Unable to complete rental.",
+      });
+    }
+  }
+);
+
 }
