@@ -4,6 +4,10 @@ import dotenv from "dotenv";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import sanitizeHtml from "sanitize-html";
 import { MongoClient, ObjectId } from "mongodb";
+import {
+  registerStripeWebhook,
+  registerBookingRoutes,
+} from "./stripe-bookings.js";
 
 dotenv.config();
 
@@ -37,6 +41,11 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
+
+let stripeBookingDb;
+
+// Stripe must receive the raw request body.
+registerStripeWebhook(app, () => stripeBookingDb);
 
 // Parse JSON requests
 app.use(express.json({ limit: "100kb" }));
@@ -402,9 +411,47 @@ async function startServer() {
 
     await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
     await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
-    await db.collection("equipment").createIndex({status: 1,createdAt: -1,});
+    await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
 
     console.log("MongoDB connected successfully");
+
+
+// stripeBookingDb############
+
+    stripeBookingDb = db;
+
+    registerBookingRoutes(app, {
+      getDb: () => stripeBookingDb,
+      getMongoClient: () => client,
+      verifyJWT,
+      requireRole,
+    });
+
+    await db.collection("bookings").createIndex({
+      equipmentId: 1,
+      status: 1,
+      startDate: 1,
+      endDate: 1,
+    });
+
+    await db.collection("bookings").createIndex({
+      customerId: 1,
+      createdAt: -1,
+    });
+
+    await db.collection("bookings").createIndex(
+      {
+        stripeSessionId: 1,
+      },
+      {
+        unique: true,
+        partialFilterExpression: {
+          stripeSessionId: {
+            $type: "string",
+          },
+        },
+      },
+    );
 
     app.listen(PORT, () => {
       console.log(`GearRento server running on port ${PORT}`);
@@ -1058,6 +1105,88 @@ app.get("/equipment", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Unable to load equipment.",
+    });
+  }
+});
+
+// ======================================
+// GET /equipment/:id
+// Public Equipment Details
+// Approved Equipment Only
+// ======================================
+
+app.get("/equipment/:id", async (req, res) => {
+  const { id } = req.params;
+
+  // Validate MongoDB ObjectId
+  if (!/^[a-f0-9]{24}$/i.test(id)) {
+    return res.status(404).json({
+      success: false,
+      error: "Equipment not found.",
+    });
+  }
+
+  try {
+    const equipment = await db.collection("equipment").findOne(
+      {
+        _id: new ObjectId(id),
+        status: "approved",
+      },
+      {
+        projection: {
+          name: 1,
+          categories: 1,
+          condition: 1,
+          divisions: 1,
+          descriptionHtml: 1,
+          imageUrls: 1,
+          dailyPrice: 1,
+          quantity: 1,
+          availableQuantity: 1,
+          createdAt: 1,
+        },
+      },
+    );
+
+    if (!equipment) {
+      return res.status(404).json({
+        success: false,
+        error: "Equipment not found.",
+      });
+    }
+
+    // Sanitize rich-text HTML before public display
+    const cleanDescription = sanitizeHtml(equipment.descriptionHtml || "", {
+      allowedTags: [
+        "p",
+        "strong",
+        "em",
+        "s",
+        "h2",
+        "h3",
+        "ul",
+        "ol",
+        "li",
+        "blockquote",
+        "br",
+      ],
+      allowedAttributes: {},
+    });
+
+    return res.status(200).json({
+      success: true,
+      equipment: {
+        ...equipment,
+        _id: equipment._id.toString(),
+        descriptionHtml: cleanDescription,
+      },
+    });
+  } catch (error) {
+    console.error("Public equipment details error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Unable to load equipment details.",
     });
   }
 });
