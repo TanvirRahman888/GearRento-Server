@@ -989,4 +989,273 @@ app.patch(
   }
 );
 
+// ==========================================
+// GET /bookings/admin
+// Admin: View all rental bookings
+// ==========================================
+
+app.get(
+  "/bookings/admin",
+  verifyJWT,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const getQuery = (key) =>
+        typeof req.query[key] === "string"
+          ? req.query[key].trim()
+          : "";
+
+      const requestedPage = Number(
+        getQuery("page") || 1
+      );
+
+      const page =
+        Number.isSafeInteger(requestedPage) &&
+        requestedPage > 0
+          ? Math.min(requestedPage, 100000)
+          : 1;
+
+      const limit = 10;
+
+      // ==================================
+      // Filters
+      // ==================================
+
+      const allowedStatuses = [
+        "all",
+        "checkout_pending",
+        "confirmed",
+        "completed",
+        "checkout_failed",
+        "payment_failed",
+        "expired",
+        "cancelled",
+      ];
+
+      const allowedPayments = [
+        "all",
+        "paid",
+        "unpaid",
+      ];
+
+      const requestedStatus = getQuery("status");
+      const requestedPayment = getQuery("payment");
+
+      const status = allowedStatuses.includes(
+        requestedStatus
+      )
+        ? requestedStatus
+        : "all";
+
+      const payment = allowedPayments.includes(
+        requestedPayment
+      )
+        ? requestedPayment
+        : "all";
+
+      const search = getQuery("q").slice(0, 100);
+
+      const filter = {};
+
+      if (status !== "all") {
+        filter.status = status;
+      }
+
+      if (payment !== "all") {
+        filter.paymentStatus = payment;
+      }
+
+      // ==================================
+      // Search equipment, customer, phone
+      // or an exact MongoDB booking ID.
+      // ==================================
+
+      if (search) {
+        const escapedSearch = search.replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
+        const matches = [
+          {
+            equipmentName: {
+              $regex: escapedSearch,
+              $options: "i",
+            },
+          },
+          {
+            fullName: {
+              $regex: escapedSearch,
+              $options: "i",
+            },
+          },
+          {
+            phone: {
+              $regex: escapedSearch,
+              $options: "i",
+            },
+          },
+        ];
+
+        if (/^[a-f0-9]{24}$/i.test(search)) {
+          matches.push({
+            _id: new ObjectId(search),
+          });
+        }
+
+        filter.$or = matches;
+      }
+
+      const collection = getDb().collection("bookings");
+
+      // ==================================
+      // Query records and global statistics
+      // ==================================
+
+      const [
+        total,
+        bookings,
+        totalBookings,
+        paidBookings,
+        confirmedBookings,
+        completedBookings,
+        grossPaidResult,
+      ] = await Promise.all([
+        // Total matching current filters
+        collection.countDocuments(filter),
+
+        // Paginated booking records
+        collection
+          .find(filter, {
+            projection: {
+              equipmentId: 1,
+              equipmentName: 1,
+              imageUrl: 1,
+
+              ownerId: 1,
+              customerId: 1,
+              fullName: 1,
+              phone: 1,
+
+              division: 1,
+              district: 1,
+              address: 1,
+              notes: 1,
+
+              startDate: 1,
+              endDate: 1,
+              totalDays: 1,
+              quantity: 1,
+
+              dailyPrice: 1,
+              totalPrice: 1,
+              currency: 1,
+
+              status: 1,
+              paymentStatus: 1,
+
+              stripeSessionId: 1,
+              createdAt: 1,
+              paidAt: 1,
+              completedAt: 1,
+            },
+          })
+          .sort({
+            createdAt: -1,
+            _id: -1,
+          })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        // Global statistics, not filtered
+        collection.countDocuments({}),
+
+        collection.countDocuments({
+          paymentStatus: "paid",
+        }),
+
+        collection.countDocuments({
+          status: "confirmed",
+          paymentStatus: "paid",
+        }),
+
+        collection.countDocuments({
+          status: "completed",
+          paymentStatus: "paid",
+        }),
+
+        // Sum paid amounts using integer paisa
+        collection
+          .aggregate([
+            {
+              $match: {
+                paymentStatus: "paid",
+                currency: "bdt",
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                totalPaisa: {
+                  $sum: {
+                    $ifNull: ["$totalPaisa", 0],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray(),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+
+        bookings: bookings.map((booking) => ({
+          ...booking,
+
+          _id: booking._id.toString(),
+
+          equipmentId:
+            booking.equipmentId?.toString() || "",
+
+          ownerId:
+            booking.ownerId?.toString() || "",
+
+          customerId:
+            booking.customerId?.toString() || "",
+        })),
+
+        stats: {
+          totalBookings,
+          paidBookings,
+          confirmedBookings,
+          completedBookings,
+
+          grossPaidAmount:
+            (grossPaidResult[0]?.totalPaisa || 0) /
+            100,
+        },
+
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      console.error(
+        "Admin All Rentals API error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Unable to load rental bookings.",
+      });
+    }
+  }
+);
+
 }

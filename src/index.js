@@ -459,6 +459,16 @@ async function startServer() {
       createdAt: -1,
     });
 
+    await db.collection("bookings").createIndex({
+      status: 1,
+      paymentStatus: 1,
+      createdAt: -1,
+    });
+
+    await db.collection("bookings").createIndex({
+      createdAt: -1,
+    });
+
     app.listen(PORT, () => {
       console.log(`GearRento server running on port ${PORT}`);
     });
