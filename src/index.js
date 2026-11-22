@@ -1,9 +1,9 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient } from "mongodb";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import sanitizeHtml from "sanitize-html";
+import { MongoClient, ObjectId } from "mongodb";
 
 dotenv.config();
 
@@ -17,7 +17,6 @@ const PORT = process.env.PORT || 5000;
 
 const CLIENT_URL = process.env.CLIENT_URL;
 const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL?.replace(/\/+$/, "");
-
 
 if (!CLIENT_URL || !BETTER_AUTH_URL || !process.env.MONGODB_URI) {
   throw new Error(
@@ -60,9 +59,7 @@ const db = client.db(process.env.DB_NAME || "GearRento");
 const jwksURL = new URL(`${BETTER_AUTH_URL}/api/auth/jwks`);
 
 // Cache the JWKS verifier
-const JWKS = createRemoteJWKSet(
-  new URL(`${BETTER_AUTH_URL}/api/auth/jwks`)
-);
+const JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_URL}/api/auth/jwks`));
 
 // ======================================
 // JWT Authentication Middleware
@@ -403,6 +400,8 @@ async function startServer() {
       .collection("ownerRequests")
       .createIndex({ userId: 1 }, { unique: true });
 
+    await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
+
     console.log("MongoDB connected successfully");
 
     app.listen(PORT, () => {
@@ -413,5 +412,354 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+// ======================================
+// GET /equipment/mine
+// Protected: Owner Only
+// ======================================
+
+app.get(
+  "/equipment/mine",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    try {
+      // Owner ID comes from the verified JWT
+      const ownerId = req.authUser.id;
+
+      // Pagination: 9 equipment listings per page
+      const requestedPage = Number(req.query.page);
+      const page =
+        Number.isSafeInteger(requestedPage) && requestedPage > 0
+          ? requestedPage
+          : 1;
+
+      const limit = 9;
+      const skip = (page - 1) * limit;
+
+      const collection = db.collection("equipment");
+
+      // Only fetch equipment belonging to this owner
+      const filter = { ownerId };
+
+      const [total, equipment] = await Promise.all([
+        collection.countDocuments(filter),
+
+        collection
+          .find(filter, {
+            projection: {
+              descriptionHtml: 0,
+            },
+          })
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+
+        equipment: equipment.map((item) => ({
+          ...item,
+          _id: item._id.toString(),
+        })),
+
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      console.error("Failed to fetch owner's equipment:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "Unable to load your equipment.",
+      });
+    }
+  },
+);
+
+
+// ======================================
+// Shared Equipment Helpers
+// ======================================
+
+function getOwnerEquipmentFilter(req) {
+  const id = req.params.id;
+
+  if (!/^[a-f0-9]{24}$/i.test(id)) {
+    return null;
+  }
+
+  return {
+    _id: new ObjectId(id),
+
+    // Owner ID comes from verified JWT
+    ownerId: req.authUser.id,
+  };
+}
+
+function cleanEquipmentDescription(html) {
+  return sanitizeHtml(html, {
+    allowedTags: [
+      "p",
+      "strong",
+      "em",
+      "s",
+      "h2",
+      "h3",
+      "ul",
+      "ol",
+      "li",
+      "blockquote",
+      "br",
+    ],
+    allowedAttributes: {},
+  });
+}
+
+function getPlainDescription(html) {
+  return sanitizeHtml(html, {
+    allowedTags: [],
+    allowedAttributes: {},
+  })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ======================================
+// GET /equipment/mine/:id
+// View One Owner Equipment
+// ======================================
+
+app.get(
+  "/equipment/mine/:id",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    const filter = getOwnerEquipmentFilter(req);
+
+    if (!filter) {
+      return res.status(400).json({
+        error: "Invalid equipment ID.",
+      });
+    }
+
+    try {
+      const equipment = await db
+        .collection("equipment")
+        .findOne(filter);
+
+      if (!equipment) {
+        return res.status(404).json({
+          error: "Equipment not found.",
+        });
+      }
+
+      // Sanitize again before rendering as HTML
+      const cleanDescription = cleanEquipmentDescription(
+        equipment.descriptionHtml || ""
+      );
+
+      return res.status(200).json({
+        success: true,
+        equipment: {
+          ...equipment,
+          _id: equipment._id.toString(),
+          descriptionHtml: cleanDescription,
+          descriptionText: getPlainDescription(
+            cleanDescription
+          ),
+        },
+      });
+    } catch (error) {
+      console.error("Equipment details error:", error);
+
+      return res.status(500).json({
+        error: "Unable to load equipment details.",
+      });
+    }
+  }
+);
+
+// ======================================
+// PATCH /equipment/mine/:id
+// Update Owner Equipment
+// ======================================
+
+app.patch(
+  "/equipment/mine/:id",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    const filter = getOwnerEquipmentFilter(req);
+
+    if (!filter) {
+      return res.status(400).json({
+        error: "Invalid equipment ID.",
+      });
+    }
+
+    const {
+      name,
+      categories,
+      condition,
+      divisions,
+      descriptionHtml,
+      imageUrls,
+      dailyPrice,
+      quantity,
+    } = req.body ?? {};
+
+    // Same validation rules as Add Equipment
+    const valid =
+      typeof name === "string" &&
+      name.trim().length >= 3 &&
+      name.trim().length <= 120 &&
+
+      Array.isArray(categories) &&
+      categories.length >= 1 &&
+      categories.length <= allowedCategories.length &&
+      categories.every((item) =>
+        allowedCategories.includes(item)
+      ) &&
+
+      allowedConditions.includes(condition) &&
+
+      Array.isArray(divisions) &&
+      divisions.length >= 1 &&
+      divisions.length <= allowedDivisions.length &&
+      divisions.every((item) =>
+        allowedDivisions.includes(item)
+      ) &&
+
+      Array.isArray(imageUrls) &&
+      imageUrls.length >= 1 &&
+      imageUrls.length <= 5 &&
+      imageUrls.every(validImageUrl) &&
+
+      typeof descriptionHtml === "string" &&
+      descriptionHtml.length <= 12000 &&
+
+      typeof dailyPrice === "number" &&
+      Number.isFinite(dailyPrice) &&
+      dailyPrice > 0 &&
+      dailyPrice <= 1000000 &&
+
+      Number.isInteger(quantity) &&
+      quantity >= 1 &&
+      quantity <= 10000;
+
+    if (!valid) {
+      return res.status(400).json({
+        error: "Invalid equipment information.",
+      });
+    }
+
+    const cleanDescription =
+      cleanEquipmentDescription(descriptionHtml);
+
+    const descriptionText =
+      getPlainDescription(cleanDescription);
+
+    if (
+      descriptionText.length < 20 ||
+      descriptionText.length > 3000
+    ) {
+      return res.status(400).json({
+        error: "Description must contain 20–3000 characters.",
+      });
+    }
+
+    try {
+      const result = await db
+        .collection("equipment")
+        .updateOne(filter, {
+          $set: {
+            name: name.trim(),
+            categories: [...new Set(categories)],
+            condition,
+            divisions: [...new Set(divisions)],
+            descriptionHtml: cleanDescription,
+            imageUrls: imageUrls.map((url) => url.trim()),
+            dailyPrice,
+            quantity,
+
+            // Safe only while there are no active bookings
+            availableQuantity: quantity,
+
+            // Require fresh approval after changes
+            status: "pending",
+            updatedAt: new Date(),
+          },
+        });
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          error: "Equipment not found.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Equipment updated successfully.",
+      });
+    } catch (error) {
+      console.error("Equipment update error:", error);
+
+      return res.status(500).json({
+        error: "Unable to update equipment.",
+      });
+    }
+  }
+);
+
+// ======================================
+// DELETE /equipment/mine/:id
+// Delete Owner Equipment
+// ======================================
+
+app.delete(
+  "/equipment/mine/:id",
+  verifyJWT,
+  requireRole("owner"),
+  async (req, res) => {
+    const filter = getOwnerEquipmentFilter(req);
+
+    if (!filter) {
+      return res.status(400).json({
+        error: "Invalid equipment ID.",
+      });
+    }
+
+    try {
+      const result = await db
+        .collection("equipment")
+        .deleteOne(filter);
+
+      if (result.deletedCount === 0) {
+        return res.status(404).json({
+          error: "Equipment not found.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Equipment deleted successfully.",
+      });
+    } catch (error) {
+      console.error("Equipment deletion error:", error);
+
+      return res.status(500).json({
+        error: "Unable to delete equipment.",
+      });
+    }
+  }
+);
+
 
 startServer();
