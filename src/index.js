@@ -10,6 +10,8 @@ import {
 } from "./stripe-bookings.js";
 import { registerAdminUserRoutes } from "./admin-users.js";
 import { registerAdminEquipmentRoutes } from "./admin-equipment.js";
+import { registerPlatformSettingsRoutes } from "./platform-settings.js";
+import { registerOwnerAvailabilityRoutes } from "./owner-availability.js";
 
 dotenv.config();
 
@@ -532,6 +534,19 @@ async function startServer() {
 
     registerAdminEquipmentRoutes(app, {
       getDb: () => db,
+      verifyJWT,
+      requireRole,
+    });
+
+    registerPlatformSettingsRoutes(app, {
+      getDb: () => db,
+      verifyJWT,
+      requireRole,
+    });
+
+    registerOwnerAvailabilityRoutes(app, {
+      getDb: () => db,
+      getMongoClient: () => client,
       verifyJWT,
       requireRole,
     });

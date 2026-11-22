@@ -1,6 +1,7 @@
 import express from "express";
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
+import { getPlatformSettings } from "./platform-settings.js";
 
 // =====================================
 // Configuration
@@ -299,9 +300,33 @@ export function registerBookingRoutes(
       const totalDays =
         Math.round((end.getTime() - start.getTime()) / DAY_MS) + 1;
 
-      if (totalDays < 1 || totalDays > 30) {
+      // Read current booking rules from MongoDB.
+      let platformSettings;
+
+      try {
+        platformSettings = await getPlatformSettings(db);
+      } catch (error) {
+        console.error("Unable to read booking settings:", error);
+
+        return res.status(503).json({
+          success: false,
+          error: "Booking service is temporarily unavailable.",
+        });
+      }
+
+      // Stop creating NEW Checkout Sessions.
+      if (!platformSettings.bookingsEnabled) {
+        return res.status(503).json({
+          success: false,
+          error: "New bookings are temporarily paused. Please try again later.",
+        });
+      }
+
+      // Enforce the configured rental duration.
+      if (totalDays < 1 || totalDays > platformSettings.maxRentalDays) {
         return res.status(400).json({
-          error: "Rental duration must be 1 to 30 days.",
+          success: false,
+          error: `Rental duration must be between 1 and ${platformSettings.maxRentalDays} days.`,
         });
       }
 
@@ -381,6 +406,31 @@ export function registerBookingRoutes(
               { _id: id },
               { session: mongoSession },
             );
+
+            // =====================================
+            // Check Owner-Blocked Dates
+            // =====================================
+
+            const blockedDates = new Set(
+              Array.isArray(equipment.blockedDates)
+                ? equipment.blockedDates
+                : [],
+            );
+
+            for (
+              let timestamp = start.getTime();
+              timestamp <= end.getTime();
+              timestamp += DAY_MS
+            ) {
+              const day = new Date(timestamp).toISOString().slice(0, 10);
+
+              if (blockedDates.has(day)) {
+                throw new BookingError(
+                  `This equipment is unavailable on ${day}. Please select different rental dates.`,
+                  409,
+                );
+              }
+            }
 
             // Validate selected rental division
             if (!equipment.divisions?.includes(division)) {
@@ -632,7 +682,6 @@ export function registerBookingRoutes(
     },
   );
 
- 
   // =====================================
   // GET /bookings/mine
   // Customer: My Bookings
@@ -647,8 +696,7 @@ export function registerBookingRoutes(
         const requestedPage = Number(req.query.page || 1);
 
         const page =
-          Number.isSafeInteger(requestedPage) &&
-          requestedPage > 0
+          Number.isSafeInteger(requestedPage) && requestedPage > 0
             ? Math.min(requestedPage, 100000)
             : 1;
 
@@ -720,9 +768,8 @@ export function registerBookingRoutes(
           error: "Unable to load your bookings.",
         });
       }
-    }
+    },
   );
-
 
   // ===================================
   // GET /bookings/session/:sessionId
@@ -782,858 +829,793 @@ export function registerBookingRoutes(
     },
   );
 
+  // ==========================================
+  // GET /bookings/owner
+  // Owner: View paid rental bookings
+  // ==========================================
 
-// ==========================================
-// GET /bookings/owner
-// Owner: View paid rental bookings
-// ==========================================
+  app.get(
+    "/bookings/owner",
+    verifyJWT,
+    requireRole("owner"),
+    async (req, res) => {
+      try {
+        const requestedPage = Number(req.query.page || 1);
 
-app.get(
-  "/bookings/owner",
-  verifyJWT,
-  requireRole("owner"),
-  async (req, res) => {
-    try {
-      const requestedPage = Number(req.query.page || 1);
+        const page =
+          Number.isSafeInteger(requestedPage) && requestedPage >= 1
+            ? Math.min(requestedPage, 100000)
+            : 1;
 
-      const page =
-        Number.isSafeInteger(requestedPage) &&
-        requestedPage >= 1
-          ? Math.min(requestedPage, 100000)
-          : 1;
+        const requestedStatus =
+          typeof req.query.status === "string" ? req.query.status : "all";
 
-      const requestedStatus =
-        typeof req.query.status === "string"
-          ? req.query.status
+        const status = ["all", "confirmed", "completed"].includes(
+          requestedStatus,
+        )
+          ? requestedStatus
           : "all";
 
-      const status = [
-        "all",
-        "confirmed",
-        "completed",
-      ].includes(requestedStatus)
-        ? requestedStatus
-        : "all";
+        const limit = 10;
 
-      const limit = 10;
+        // IMPORTANT: Owner ID comes from JWT,
+        // never from request query parameters.
+        const baseFilter = {
+          ownerId: req.authUser.id,
+          paymentStatus: "paid",
+        };
 
-      // IMPORTANT: Owner ID comes from JWT,
-      // never from request query parameters.
-      const baseFilter = {
-        ownerId: req.authUser.id,
-        paymentStatus: "paid",
-      };
-
-      const filter = {
-        ...baseFilter,
-        status:
-          status === "all"
-            ? { $in: ["confirmed", "completed"] }
-            : status,
-      };
-
-      const collection = getDb().collection("bookings");
-
-      const [
-        total,
-        confirmedCount,
-        completedCount,
-        bookings,
-      ] = await Promise.all([
-        collection.countDocuments(filter),
-
-        collection.countDocuments({
+        const filter = {
           ...baseFilter,
-          status: "confirmed",
-        }),
+          status:
+            status === "all" ? { $in: ["confirmed", "completed"] } : status,
+        };
 
-        collection.countDocuments({
-          ...baseFilter,
-          status: "completed",
-        }),
+        const collection = getDb().collection("bookings");
 
-        collection
-          .find(filter, {
-            projection: {
-              equipmentId: 1,
-              equipmentName: 1,
-              imageUrl: 1,
+        const [total, confirmedCount, completedCount, bookings] =
+          await Promise.all([
+            collection.countDocuments(filter),
 
-              customerId: 1,
-              fullName: 1,
-              phone: 1,
-              division: 1,
-              district: 1,
-              address: 1,
-              notes: 1,
+            collection.countDocuments({
+              ...baseFilter,
+              status: "confirmed",
+            }),
 
-              startDate: 1,
-              endDate: 1,
-              totalDays: 1,
-              quantity: 1,
-
-              dailyPrice: 1,
-              totalPrice: 1,
-              currency: 1,
-
-              status: 1,
-              paymentStatus: 1,
-              createdAt: 1,
-              completedAt: 1,
-            },
-          })
-          .sort({ createdAt: -1, _id: -1 })
-          .skip((page - 1) * limit)
-          .limit(limit)
-          .toArray(),
-      ]);
-
-      return res.status(200).json({
-        success: true,
-
-        bookings: bookings.map((booking) => ({
-          ...booking,
-          _id: booking._id.toString(),
-          equipmentId: booking.equipmentId.toString(),
-        })),
-
-        stats: {
-          total: confirmedCount + completedCount,
-          confirmed: confirmedCount,
-          completed: completedCount,
-        },
-
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages: Math.ceil(total / limit),
-        },
-      });
-    } catch (error) {
-      console.error("Owner rentals error:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Unable to load rental bookings.",
-      });
-    }
-  }
-);
-
-// ==========================================
-// PATCH /bookings/owner/:id/complete
-// Owner: Mark a returned rental completed
-// ==========================================
-
-app.patch(
-  "/bookings/owner/:id/complete",
-  verifyJWT,
-  requireRole("owner"),
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      if (!/^[a-f0-9]{24}$/i.test(id)) {
-        return res.status(400).json({
-          success: false,
-          error: "Invalid booking ID.",
-        });
-      }
-
-      const today = todayInBangladesh();
-
-      // Atomic conditional update:
-      // - correct Owner
-      // - confirmed and paid booking
-      // - rental period already ended
-      const result = await getDb()
-        .collection("bookings")
-        .updateOne(
-          {
-            _id: new ObjectId(id),
-            ownerId: req.authUser.id,
-            status: "confirmed",
-            paymentStatus: "paid",
-            endDate: { $lt: today },
-          },
-          {
-            $set: {
+            collection.countDocuments({
+              ...baseFilter,
               status: "completed",
-              completedAt: new Date(),
-              updatedAt: new Date(),
-            },
-          }
-        );
+            }),
 
-      if (result.matchedCount === 0) {
-        return res.status(409).json({
+            collection
+              .find(filter, {
+                projection: {
+                  equipmentId: 1,
+                  equipmentName: 1,
+                  imageUrl: 1,
+
+                  customerId: 1,
+                  fullName: 1,
+                  phone: 1,
+                  division: 1,
+                  district: 1,
+                  address: 1,
+                  notes: 1,
+
+                  startDate: 1,
+                  endDate: 1,
+                  totalDays: 1,
+                  quantity: 1,
+
+                  dailyPrice: 1,
+                  totalPrice: 1,
+                  currency: 1,
+
+                  status: 1,
+                  paymentStatus: 1,
+                  createdAt: 1,
+                  completedAt: 1,
+                },
+              })
+              .sort({ createdAt: -1, _id: -1 })
+              .skip((page - 1) * limit)
+              .limit(limit)
+              .toArray(),
+          ]);
+
+        return res.status(200).json({
+          success: true,
+
+          bookings: bookings.map((booking) => ({
+            ...booking,
+            _id: booking._id.toString(),
+            equipmentId: booking.equipmentId.toString(),
+          })),
+
+          stats: {
+            total: confirmedCount + completedCount,
+            confirmed: confirmedCount,
+            completed: completedCount,
+          },
+
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Owner rentals error:", error);
+
+        return res.status(500).json({
           success: false,
-          error:
-            "Booking not eligible for completion. Check ownership, payment status, and rental end date.",
+          error: "Unable to load rental bookings.",
         });
       }
+    },
+  );
 
-      return res.status(200).json({
-        success: true,
-        message: "Rental marked as completed.",
-      });
-    } catch (error) {
-      console.error("Complete rental error:", error);
+  // ==========================================
+  // PATCH /bookings/owner/:id/complete
+  // Owner: Mark a returned rental completed
+  // ==========================================
 
-      return res.status(500).json({
-        success: false,
-        error: "Unable to complete rental.",
-      });
-    }
-  }
-);
+  app.patch(
+    "/bookings/owner/:id/complete",
+    verifyJWT,
+    requireRole("owner"),
+    async (req, res) => {
+      try {
+        const { id } = req.params;
 
-// ==========================================
-// GET /bookings/admin
-// Admin: View all rental bookings
-// ==========================================
-
-app.get(
-  "/bookings/admin",
-  verifyJWT,
-  requireRole("admin"),
-  async (req, res) => {
-    try {
-      const getQuery = (key) =>
-        typeof req.query[key] === "string"
-          ? req.query[key].trim()
-          : "";
-
-      const requestedPage = Number(
-        getQuery("page") || 1
-      );
-
-      const page =
-        Number.isSafeInteger(requestedPage) &&
-        requestedPage > 0
-          ? Math.min(requestedPage, 100000)
-          : 1;
-
-      const limit = 10;
-
-      // ==================================
-      // Filters
-      // ==================================
-
-      const allowedStatuses = [
-        "all",
-        "checkout_pending",
-        "confirmed",
-        "completed",
-        "checkout_failed",
-        "payment_failed",
-        "expired",
-        "cancelled",
-      ];
-
-      const allowedPayments = [
-        "all",
-        "paid",
-        "unpaid",
-      ];
-
-      const requestedStatus = getQuery("status");
-      const requestedPayment = getQuery("payment");
-
-      const status = allowedStatuses.includes(
-        requestedStatus
-      )
-        ? requestedStatus
-        : "all";
-
-      const payment = allowedPayments.includes(
-        requestedPayment
-      )
-        ? requestedPayment
-        : "all";
-
-      const search = getQuery("q").slice(0, 100);
-
-      const filter = {};
-
-      if (status !== "all") {
-        filter.status = status;
-      }
-
-      if (payment !== "all") {
-        filter.paymentStatus = payment;
-      }
-
-      // ==================================
-      // Search equipment, customer, phone
-      // or an exact MongoDB booking ID.
-      // ==================================
-
-      if (search) {
-        const escapedSearch = search.replace(
-          /[.*+?^${}()|[\]\\]/g,
-          "\\$&"
-        );
-
-        const matches = [
-          {
-            equipmentName: {
-              $regex: escapedSearch,
-              $options: "i",
-            },
-          },
-          {
-            fullName: {
-              $regex: escapedSearch,
-              $options: "i",
-            },
-          },
-          {
-            phone: {
-              $regex: escapedSearch,
-              $options: "i",
-            },
-          },
-        ];
-
-        if (/^[a-f0-9]{24}$/i.test(search)) {
-          matches.push({
-            _id: new ObjectId(search),
+        if (!/^[a-f0-9]{24}$/i.test(id)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid booking ID.",
           });
         }
 
-        filter.$or = matches;
+        const today = todayInBangladesh();
+
+        // Atomic conditional update:
+        // - correct Owner
+        // - confirmed and paid booking
+        // - rental period already ended
+        const result = await getDb()
+          .collection("bookings")
+          .updateOne(
+            {
+              _id: new ObjectId(id),
+              ownerId: req.authUser.id,
+              status: "confirmed",
+              paymentStatus: "paid",
+              endDate: { $lt: today },
+            },
+            {
+              $set: {
+                status: "completed",
+                completedAt: new Date(),
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+        if (result.matchedCount === 0) {
+          return res.status(409).json({
+            success: false,
+            error:
+              "Booking not eligible for completion. Check ownership, payment status, and rental end date.",
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: "Rental marked as completed.",
+        });
+      } catch (error) {
+        console.error("Complete rental error:", error);
+
+        return res.status(500).json({
+          success: false,
+          error: "Unable to complete rental.",
+        });
       }
+    },
+  );
 
-      const collection = getDb().collection("bookings");
+  // ==========================================
+  // GET /bookings/admin
+  // Admin: View all rental bookings
+  // ==========================================
 
-      // ==================================
-      // Query records and global statistics
-      // ==================================
+  app.get(
+    "/bookings/admin",
+    verifyJWT,
+    requireRole("admin"),
+    async (req, res) => {
+      try {
+        const getQuery = (key) =>
+          typeof req.query[key] === "string" ? req.query[key].trim() : "";
 
-      const [
-        total,
-        bookings,
-        totalBookings,
-        paidBookings,
-        confirmedBookings,
-        completedBookings,
-        grossPaidResult,
-      ] = await Promise.all([
-        // Total matching current filters
-        collection.countDocuments(filter),
+        const requestedPage = Number(getQuery("page") || 1);
 
-        // Paginated booking records
-        collection
-          .find(filter, {
-            projection: {
-              equipmentId: 1,
-              equipmentName: 1,
-              imageUrl: 1,
+        const page =
+          Number.isSafeInteger(requestedPage) && requestedPage > 0
+            ? Math.min(requestedPage, 100000)
+            : 1;
 
-              ownerId: 1,
-              customerId: 1,
-              fullName: 1,
-              phone: 1,
+        const limit = 10;
 
-              division: 1,
-              district: 1,
-              address: 1,
-              notes: 1,
+        // ==================================
+        // Filters
+        // ==================================
 
-              startDate: 1,
-              endDate: 1,
-              totalDays: 1,
-              quantity: 1,
+        const allowedStatuses = [
+          "all",
+          "checkout_pending",
+          "confirmed",
+          "completed",
+          "checkout_failed",
+          "payment_failed",
+          "expired",
+          "cancelled",
+        ];
 
-              dailyPrice: 1,
-              totalPrice: 1,
-              currency: 1,
+        const allowedPayments = ["all", "paid", "unpaid"];
 
-              status: 1,
-              paymentStatus: 1,
+        const requestedStatus = getQuery("status");
+        const requestedPayment = getQuery("payment");
 
-              stripeSessionId: 1,
-              createdAt: 1,
-              paidAt: 1,
-              completedAt: 1,
-            },
-          })
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
-          .skip((page - 1) * limit)
-          .limit(limit)
-          .toArray(),
+        const status = allowedStatuses.includes(requestedStatus)
+          ? requestedStatus
+          : "all";
 
-        // Global statistics, not filtered
-        collection.countDocuments({}),
+        const payment = allowedPayments.includes(requestedPayment)
+          ? requestedPayment
+          : "all";
 
-        collection.countDocuments({
-          paymentStatus: "paid",
-        }),
+        const search = getQuery("q").slice(0, 100);
 
-        collection.countDocuments({
-          status: "confirmed",
-          paymentStatus: "paid",
-        }),
+        const filter = {};
 
-        collection.countDocuments({
-          status: "completed",
-          paymentStatus: "paid",
-        }),
+        if (status !== "all") {
+          filter.status = status;
+        }
 
-        // Sum paid amounts using integer paisa
-        collection
-          .aggregate([
+        if (payment !== "all") {
+          filter.paymentStatus = payment;
+        }
+
+        // ==================================
+        // Search equipment, customer, phone
+        // or an exact MongoDB booking ID.
+        // ==================================
+
+        if (search) {
+          const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+          const matches = [
             {
-              $match: {
-                paymentStatus: "paid",
-                currency: "bdt",
+              equipmentName: {
+                $regex: escapedSearch,
+                $options: "i",
               },
             },
             {
-              $group: {
-                _id: null,
-                totalPaisa: {
-                  $sum: {
-                    $ifNull: ["$totalPaisa", 0],
-                  },
-                },
+              fullName: {
+                $regex: escapedSearch,
+                $options: "i",
               },
             },
-          ])
-          .toArray(),
-      ]);
+            {
+              phone: {
+                $regex: escapedSearch,
+                $options: "i",
+              },
+            },
+          ];
 
-      return res.status(200).json({
-        success: true,
+          if (/^[a-f0-9]{24}$/i.test(search)) {
+            matches.push({
+              _id: new ObjectId(search),
+            });
+          }
 
-        bookings: bookings.map((booking) => ({
-          ...booking,
+          filter.$or = matches;
+        }
 
-          _id: booking._id.toString(),
+        const collection = getDb().collection("bookings");
 
-          equipmentId:
-            booking.equipmentId?.toString() || "",
+        // ==================================
+        // Query records and global statistics
+        // ==================================
 
-          ownerId:
-            booking.ownerId?.toString() || "",
-
-          customerId:
-            booking.customerId?.toString() || "",
-        })),
-
-        stats: {
+        const [
+          total,
+          bookings,
           totalBookings,
           paidBookings,
           confirmedBookings,
           completedBookings,
+          grossPaidResult,
+        ] = await Promise.all([
+          // Total matching current filters
+          collection.countDocuments(filter),
 
-          grossPaidAmount:
-            (grossPaidResult[0]?.totalPaisa || 0) /
-            100,
-        },
+          // Paginated booking records
+          collection
+            .find(filter, {
+              projection: {
+                equipmentId: 1,
+                equipmentName: 1,
+                imageUrl: 1,
 
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages: Math.ceil(total / limit),
-        },
-      });
-    } catch (error) {
-      console.error(
-        "Admin All Rentals API error:",
-        error
-      );
+                ownerId: 1,
+                customerId: 1,
+                fullName: 1,
+                phone: 1,
 
-      return res.status(500).json({
-        success: false,
-        error: "Unable to load rental bookings.",
-      });
-    }
-  }
-);
+                division: 1,
+                district: 1,
+                address: 1,
+                notes: 1,
 
+                startDate: 1,
+                endDate: 1,
+                totalDays: 1,
+                quantity: 1,
 
-// ==========================================
-// Helper: Last 6 months in Bangladesh
-// ==========================================
+                dailyPrice: 1,
+                totalPrice: 1,
+                currency: 1,
 
-function getLastSixMonths() {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Dhaka",
-    year: "numeric",
-    month: "2-digit",
-  }).formatToParts(new Date());
+                status: 1,
+                paymentStatus: 1,
 
-  const values = Object.fromEntries(
-    parts.map((part) => [part.type, part.value])
+                stripeSessionId: 1,
+                createdAt: 1,
+                paidAt: 1,
+                completedAt: 1,
+              },
+            })
+            .sort({
+              createdAt: -1,
+              _id: -1,
+            })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+
+          // Global statistics, not filtered
+          collection.countDocuments({}),
+
+          collection.countDocuments({
+            paymentStatus: "paid",
+          }),
+
+          collection.countDocuments({
+            status: "confirmed",
+            paymentStatus: "paid",
+          }),
+
+          collection.countDocuments({
+            status: "completed",
+            paymentStatus: "paid",
+          }),
+
+          // Sum paid amounts using integer paisa
+          collection
+            .aggregate([
+              {
+                $match: {
+                  paymentStatus: "paid",
+                  currency: "bdt",
+                },
+              },
+              {
+                $group: {
+                  _id: null,
+                  totalPaisa: {
+                    $sum: {
+                      $ifNull: ["$totalPaisa", 0],
+                    },
+                  },
+                },
+              },
+            ])
+            .toArray(),
+        ]);
+
+        return res.status(200).json({
+          success: true,
+
+          bookings: bookings.map((booking) => ({
+            ...booking,
+
+            _id: booking._id.toString(),
+
+            equipmentId: booking.equipmentId?.toString() || "",
+
+            ownerId: booking.ownerId?.toString() || "",
+
+            customerId: booking.customerId?.toString() || "",
+          })),
+
+          stats: {
+            totalBookings,
+            paidBookings,
+            confirmedBookings,
+            completedBookings,
+
+            grossPaidAmount: (grossPaidResult[0]?.totalPaisa || 0) / 100,
+          },
+
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Admin All Rentals API error:", error);
+
+        return res.status(500).json({
+          success: false,
+          error: "Unable to load rental bookings.",
+        });
+      }
+    },
   );
 
-  const year = Number(values.year);
-  const month = Number(values.month);
+  // ==========================================
+  // Helper: Last 6 months in Bangladesh
+  // ==========================================
 
-  const months = [];
+  function getLastSixMonths() {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Dhaka",
+      year: "numeric",
+      month: "2-digit",
+    }).formatToParts(new Date());
 
-  for (let i = 5; i >= 0; i--) {
-    const date = new Date(
-      Date.UTC(year, month - 1 - i, 1)
+    const values = Object.fromEntries(
+      parts.map((part) => [part.type, part.value]),
     );
 
-    months.push(date.toISOString().slice(0, 7));
+    const year = Number(values.year);
+    const month = Number(values.month);
+
+    const months = [];
+
+    for (let i = 5; i >= 0; i--) {
+      const date = new Date(Date.UTC(year, month - 1 - i, 1));
+
+      months.push(date.toISOString().slice(0, 7));
+    }
+
+    return months;
   }
 
-  return months;
-}
+  // ==========================================
+  // GET /bookings/admin/analytics
+  // Admin: Analytics Dashboard
+  // ==========================================
 
-// ==========================================
-// GET /bookings/admin/analytics
-// Admin: Analytics Dashboard
-// ==========================================
+  app.get(
+    "/bookings/admin/analytics",
+    verifyJWT,
+    requireRole("admin"),
+    async (req, res) => {
+      try {
+        const collection = getDb().collection("bookings");
 
-app.get(
-  "/bookings/admin/analytics",
-  verifyJWT,
-  requireRole("admin"),
-  async (req, res) => {
-    try {
-      const collection = getDb().collection("bookings");
+        const months = getLastSixMonths();
 
-      const months = getLastSixMonths();
-
-      const paidFilter = {
-        paymentStatus: "paid",
-        currency: "bdt",
-      };
-
-      // Integer paisa avoids floating-point
-      // accumulation of currency values.
-      // Older records can fall back to totalPrice.
-      const amountInPaisa = {
-        $ifNull: [
-          "$totalPaisa",
-          {
-            $round: [
-              { $multiply: ["$totalPrice", 100] },
-              0,
-            ],
-          },
-        ],
-      };
-
-      const [
-        totalBookings,
-        paidBookings,
-        confirmedRentals,
-        completedRentals,
-        totalRevenueResult,
-        monthlyBookingResult,
-        monthlyPaymentResult,
-        topEquipmentResult,
-        categoryResult,
-      ] = await Promise.all([
-        // All booking records
-        collection.countDocuments({}),
-
-        // Successfully paid bookings
-        collection.countDocuments(paidFilter),
-
-        // Confirmed rentals
-        collection.countDocuments({
-          ...paidFilter,
-          status: "confirmed",
-        }),
-
-        // Completed rentals
-        collection.countDocuments({
-          ...paidFilter,
-          status: "completed",
-        }),
-
-        // ==================================
-        // Gross Paid Amount
-        // ==================================
-
-        collection
-          .aggregate([
-            { $match: paidFilter },
-
-            {
-              $group: {
-                _id: null,
-                totalPaisa: {
-                  $sum: amountInPaisa,
-                },
-              },
-            },
-          ])
-          .toArray(),
-
-        // ==================================
-        // Monthly Booking Activity
-        // Includes all Checkout attempts
-        // ==================================
-
-        collection
-          .aggregate([
-            {
-              $match: {
-                createdAt: { $type: "date" },
-              },
-            },
-
-            {
-              $group: {
-                _id: {
-                  $dateToString: {
-                    format: "%Y-%m",
-                    date: "$createdAt",
-                    timezone: "Asia/Dhaka",
-                  },
-                },
-                bookings: { $sum: 1 },
-              },
-            },
-
-            {
-              $match: {
-                _id: { $in: months },
-              },
-            },
-          ])
-          .toArray(),
-
-        // ==================================
-        // Monthly Paid Bookings and Revenue
-        // Uses paidAt, falling back to createdAt
-        // ==================================
-
-        collection
-          .aggregate([
-            { $match: paidFilter },
-
-            {
-              $project: {
-                month: {
-                  $dateToString: {
-                    format: "%Y-%m",
-                    date: {
-                      $ifNull: [
-                        "$paidAt",
-                        "$createdAt",
-                      ],
-                    },
-                    timezone: "Asia/Dhaka",
-                  },
-                },
-                amount: amountInPaisa,
-              },
-            },
-
-            {
-              $group: {
-                _id: "$month",
-                paidBookings: { $sum: 1 },
-                grossPaisa: { $sum: "$amount" },
-              },
-            },
-
-            {
-              $match: {
-                _id: { $in: months },
-              },
-            },
-          ])
-          .toArray(),
-
-        // ==================================
-        // Top 5 Rented Equipment
-        // Paid bookings only
-        // ==================================
-
-        collection
-          .aggregate([
-            { $match: paidFilter },
-
-            {
-              $group: {
-                _id: "$equipmentId",
-                name: { $first: "$equipmentName" },
-                paidBookings: { $sum: 1 },
-                unitsRented: { $sum: "$quantity" },
-                grossPaisa: { $sum: amountInPaisa },
-              },
-            },
-
-            {
-              $sort: {
-                paidBookings: -1,
-                unitsRented: -1,
-              },
-            },
-
-            { $limit: 5 },
-          ])
-          .toArray(),
-
-        // ==================================
-        // Equipment Category Performance
-        // Join bookings with equipment
-        // ==================================
-
-        collection
-          .aggregate([
-            { $match: paidFilter },
-
-            {
-              $lookup: {
-                from: "equipment",
-                localField: "equipmentId",
-                foreignField: "_id",
-                as: "equipment",
-              },
-            },
-
-            {
-              $unwind: {
-                path: "$equipment",
-                preserveNullAndEmptyArrays: true,
-              },
-            },
-
-            {
-              $project: {
-                categories: {
-                  $cond: [
-                    {
-                      $gt: [
-                        {
-                          $size: {
-                            $ifNull: [
-                              "$equipment.categories",
-                              [],
-                            ],
-                          },
-                        },
-                        0,
-                      ],
-                    },
-                    "$equipment.categories",
-                    ["Uncategorized"],
-                  ],
-                },
-
-                unitsRented: "$quantity",
-              },
-            },
-
-            { $unwind: "$categories" },
-
-            {
-              $group: {
-                _id: "$categories",
-                paidBookings: { $sum: 1 },
-                unitsRented: { $sum: "$unitsRented" },
-              },
-            },
-
-            {
-              $sort: {
-                paidBookings: -1,
-                _id: 1,
-              },
-            },
-
-            { $limit: 8 },
-          ])
-          .toArray(),
-      ]);
-
-      // ==================================
-      // Fill missing months with zero values
-      // ==================================
-
-      const bookingMap = new Map(
-        monthlyBookingResult.map((item) => [
-          item._id,
-          item,
-        ])
-      );
-
-      const paymentMap = new Map(
-        monthlyPaymentResult.map((item) => [
-          item._id,
-          item,
-        ])
-      );
-
-      const monthly = months.map((month) => {
-        const booking = bookingMap.get(month);
-        const payment = paymentMap.get(month);
-
-        return {
-          month,
-          bookings: booking?.bookings || 0,
-          paidBookings: payment?.paidBookings || 0,
-          grossPaidAmount:
-            (payment?.grossPaisa || 0) / 100,
+        const paidFilter = {
+          paymentStatus: "paid",
+          currency: "bdt",
         };
-      });
 
-      // ==================================
-      // Response
-      // ==================================
+        // Integer paisa avoids floating-point
+        // accumulation of currency values.
+        // Older records can fall back to totalPrice.
+        const amountInPaisa = {
+          $ifNull: [
+            "$totalPaisa",
+            {
+              $round: [{ $multiply: ["$totalPrice", 100] }, 0],
+            },
+          ],
+        };
 
-      return res.status(200).json({
-        success: true,
-
-        stats: {
+        const [
           totalBookings,
           paidBookings,
           confirmedRentals,
           completedRentals,
+          totalRevenueResult,
+          monthlyBookingResult,
+          monthlyPaymentResult,
+          topEquipmentResult,
+          categoryResult,
+        ] = await Promise.all([
+          // All booking records
+          collection.countDocuments({}),
 
-          grossPaidAmount:
-            (totalRevenueResult[0]?.totalPaisa || 0) /
-            100,
-        },
+          // Successfully paid bookings
+          collection.countDocuments(paidFilter),
 
-        monthly,
+          // Confirmed rentals
+          collection.countDocuments({
+            ...paidFilter,
+            status: "confirmed",
+          }),
 
-        topEquipment: topEquipmentResult.map(
-          (item) => ({
+          // Completed rentals
+          collection.countDocuments({
+            ...paidFilter,
+            status: "completed",
+          }),
+
+          // ==================================
+          // Gross Paid Amount
+          // ==================================
+
+          collection
+            .aggregate([
+              { $match: paidFilter },
+
+              {
+                $group: {
+                  _id: null,
+                  totalPaisa: {
+                    $sum: amountInPaisa,
+                  },
+                },
+              },
+            ])
+            .toArray(),
+
+          // ==================================
+          // Monthly Booking Activity
+          // Includes all Checkout attempts
+          // ==================================
+
+          collection
+            .aggregate([
+              {
+                $match: {
+                  createdAt: { $type: "date" },
+                },
+              },
+
+              {
+                $group: {
+                  _id: {
+                    $dateToString: {
+                      format: "%Y-%m",
+                      date: "$createdAt",
+                      timezone: "Asia/Dhaka",
+                    },
+                  },
+                  bookings: { $sum: 1 },
+                },
+              },
+
+              {
+                $match: {
+                  _id: { $in: months },
+                },
+              },
+            ])
+            .toArray(),
+
+          // ==================================
+          // Monthly Paid Bookings and Revenue
+          // Uses paidAt, falling back to createdAt
+          // ==================================
+
+          collection
+            .aggregate([
+              { $match: paidFilter },
+
+              {
+                $project: {
+                  month: {
+                    $dateToString: {
+                      format: "%Y-%m",
+                      date: {
+                        $ifNull: ["$paidAt", "$createdAt"],
+                      },
+                      timezone: "Asia/Dhaka",
+                    },
+                  },
+                  amount: amountInPaisa,
+                },
+              },
+
+              {
+                $group: {
+                  _id: "$month",
+                  paidBookings: { $sum: 1 },
+                  grossPaisa: { $sum: "$amount" },
+                },
+              },
+
+              {
+                $match: {
+                  _id: { $in: months },
+                },
+              },
+            ])
+            .toArray(),
+
+          // ==================================
+          // Top 5 Rented Equipment
+          // Paid bookings only
+          // ==================================
+
+          collection
+            .aggregate([
+              { $match: paidFilter },
+
+              {
+                $group: {
+                  _id: "$equipmentId",
+                  name: { $first: "$equipmentName" },
+                  paidBookings: { $sum: 1 },
+                  unitsRented: { $sum: "$quantity" },
+                  grossPaisa: { $sum: amountInPaisa },
+                },
+              },
+
+              {
+                $sort: {
+                  paidBookings: -1,
+                  unitsRented: -1,
+                },
+              },
+
+              { $limit: 5 },
+            ])
+            .toArray(),
+
+          // ==================================
+          // Equipment Category Performance
+          // Join bookings with equipment
+          // ==================================
+
+          collection
+            .aggregate([
+              { $match: paidFilter },
+
+              {
+                $lookup: {
+                  from: "equipment",
+                  localField: "equipmentId",
+                  foreignField: "_id",
+                  as: "equipment",
+                },
+              },
+
+              {
+                $unwind: {
+                  path: "$equipment",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+
+              {
+                $project: {
+                  categories: {
+                    $cond: [
+                      {
+                        $gt: [
+                          {
+                            $size: {
+                              $ifNull: ["$equipment.categories", []],
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                      "$equipment.categories",
+                      ["Uncategorized"],
+                    ],
+                  },
+
+                  unitsRented: "$quantity",
+                },
+              },
+
+              { $unwind: "$categories" },
+
+              {
+                $group: {
+                  _id: "$categories",
+                  paidBookings: { $sum: 1 },
+                  unitsRented: { $sum: "$unitsRented" },
+                },
+              },
+
+              {
+                $sort: {
+                  paidBookings: -1,
+                  _id: 1,
+                },
+              },
+
+              { $limit: 8 },
+            ])
+            .toArray(),
+        ]);
+
+        // ==================================
+        // Fill missing months with zero values
+        // ==================================
+
+        const bookingMap = new Map(
+          monthlyBookingResult.map((item) => [item._id, item]),
+        );
+
+        const paymentMap = new Map(
+          monthlyPaymentResult.map((item) => [item._id, item]),
+        );
+
+        const monthly = months.map((month) => {
+          const booking = bookingMap.get(month);
+          const payment = paymentMap.get(month);
+
+          return {
+            month,
+            bookings: booking?.bookings || 0,
+            paidBookings: payment?.paidBookings || 0,
+            grossPaidAmount: (payment?.grossPaisa || 0) / 100,
+          };
+        });
+
+        // ==================================
+        // Response
+        // ==================================
+
+        return res.status(200).json({
+          success: true,
+
+          stats: {
+            totalBookings,
+            paidBookings,
+            confirmedRentals,
+            completedRentals,
+
+            grossPaidAmount: (totalRevenueResult[0]?.totalPaisa || 0) / 100,
+          },
+
+          monthly,
+
+          topEquipment: topEquipmentResult.map((item) => ({
             equipmentId: item._id?.toString() || "",
             name: item.name || "Unknown equipment",
             paidBookings: item.paidBookings,
             unitsRented: item.unitsRented,
-            grossPaidAmount:
-              (item.grossPaisa || 0) / 100,
-          })
-        ),
+            grossPaidAmount: (item.grossPaisa || 0) / 100,
+          })),
 
-        categories: categoryResult.map((item) => ({
-          name: item._id,
-          paidBookings: item.paidBookings,
-          unitsRented: item.unitsRented,
-        })),
-      });
-    } catch (error) {
-      console.error(
-        "Admin analytics error:",
-        error
-      );
+          categories: categoryResult.map((item) => ({
+            name: item._id,
+            paidBookings: item.paidBookings,
+            unitsRented: item.unitsRented,
+          })),
+        });
+      } catch (error) {
+        console.error("Admin analytics error:", error);
 
-      return res.status(500).json({
-        success: false,
-        error: "Unable to load analytics.",
-      });
-    }
-  }
-);
-
-
+        return res.status(500).json({
+          success: false,
+          error: "Unable to load analytics.",
+        });
+      }
+    },
+  );
 }
