@@ -632,9 +632,11 @@ export function registerBookingRoutes(
     },
   );
 
-  // ===================================
+ 
+  // =====================================
   // GET /bookings/mine
-  // ===================================
+  // Customer: My Bookings
+  // =====================================
 
   app.get(
     "/bookings/mine",
@@ -642,46 +644,85 @@ export function registerBookingRoutes(
     requireRole("customer"),
     async (req, res) => {
       try {
-        const bookings = await getDb()
-          .collection("bookings")
-          .find(
-            {
-              customerId: req.authUser.id,
-            },
-            {
+        const requestedPage = Number(req.query.page || 1);
+
+        const page =
+          Number.isSafeInteger(requestedPage) &&
+          requestedPage > 0
+            ? Math.min(requestedPage, 100000)
+            : 1;
+
+        const limit = 10;
+
+        // Only show bookings belonging to
+        // the authenticated Customer
+        const filter = {
+          customerId: req.authUser.id,
+        };
+
+        const collection = getDb().collection("bookings");
+
+        const [total, bookings] = await Promise.all([
+          collection.countDocuments(filter),
+
+          collection
+            .find(filter, {
               projection: {
+                equipmentId: 1,
                 equipmentName: 1,
                 imageUrl: 1,
+
                 startDate: 1,
                 endDate: 1,
+                totalDays: 1,
                 quantity: 1,
+
+                dailyPrice: 1,
                 totalPrice: 1,
                 currency: 1,
+
                 status: 1,
+                paymentStatus: 1,
+
                 createdAt: 1,
               },
-            },
-          )
-          .sort({ createdAt: -1 })
-          .limit(50)
-          .toArray();
+            })
+            .sort({
+              createdAt: -1,
+              _id: -1,
+            })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+        ]);
 
-        return res.json({
+        return res.status(200).json({
           success: true,
+
           bookings: bookings.map((booking) => ({
             ...booking,
             _id: booking._id.toString(),
+            equipmentId: booking.equipmentId.toString(),
           })),
+
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
         });
       } catch (error) {
-        console.error("My bookings error:", error);
+        console.error("My Bookings API error:", error);
 
         return res.status(500).json({
-          error: "Unable to load bookings.",
+          success: false,
+          error: "Unable to load your bookings.",
         });
       }
-    },
+    }
   );
+
 
   // ===================================
   // GET /bookings/session/:sessionId
