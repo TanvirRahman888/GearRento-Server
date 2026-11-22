@@ -8,6 +8,8 @@ import {
   registerStripeWebhook,
   registerBookingRoutes,
 } from "./stripe-bookings.js";
+import { registerAdminUserRoutes } from "./admin-users.js";
+import { registerAdminEquipmentRoutes } from "./admin-equipment.js";
 
 dotenv.config();
 
@@ -116,10 +118,47 @@ async function verifyJWT(req, res, next) {
       });
     }
 
-    // Attach verified user information
+    // ======================================
+    // Verify user's current database role
+    // ======================================
+
+    const idCandidates = [payload.sub];
+
+    if (/^[a-f0-9]{24}$/i.test(payload.sub)) {
+      idCandidates.push(new ObjectId(payload.sub));
+    }
+
+    const storedUser = await db.collection("user").findOne(
+      {
+        _id: {
+          $in: idCandidates,
+        },
+      },
+      {
+        projection: {
+          role: 1,
+        },
+      },
+    );
+
+    if (!storedUser) {
+      return res.status(401).json({
+        success: false,
+        error: "User account no longer exists.",
+      });
+    }
+
+    if (storedUser.role !== payload.role) {
+      return res.status(403).json({
+        success: false,
+        error:
+          "Your account role has changed. Please sign out and sign in again.",
+      });
+    }
+
     req.authUser = {
       id: payload.sub,
-      role: payload.role,
+      role: storedUser.role,
     };
 
     next();
@@ -419,11 +458,18 @@ async function startServer() {
 
     stripeBookingDb = db;
 
-    registerBookingRoutes(app, {
-      getDb: () => stripeBookingDb,
+    registerAdminUserRoutes(app, {
+      getDb: () => db,
       getMongoClient: () => client,
       verifyJWT,
       requireRole,
+    });
+
+    // Create the audit-log collection/index
+    // before using user-management transactions.
+    await db.collection("adminAuditLogs").createIndex({
+      actorId: 1,
+      createdAt: -1,
     });
 
     await db.collection("bookings").createIndex({
@@ -467,6 +513,20 @@ async function startServer() {
 
     await db.collection("bookings").createIndex({
       createdAt: -1,
+    });
+
+    // New Admin user management routes
+    registerAdminUserRoutes(app, {
+      getDb: () => db,
+      getMongoClient: () => client,
+      verifyJWT,
+      requireRole,
+    });
+
+    registerAdminEquipmentRoutes(app, {
+      getDb: () => db,
+      verifyJWT,
+      requireRole,
     });
 
     app.listen(PORT, () => {
