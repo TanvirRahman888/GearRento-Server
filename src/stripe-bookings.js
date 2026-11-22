@@ -1258,4 +1258,382 @@ app.get(
   }
 );
 
+
+// ==========================================
+// Helper: Last 6 months in Bangladesh
+// ==========================================
+
+function getLastSixMonths() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Dhaka",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts.map((part) => [part.type, part.value])
+  );
+
+  const year = Number(values.year);
+  const month = Number(values.month);
+
+  const months = [];
+
+  for (let i = 5; i >= 0; i--) {
+    const date = new Date(
+      Date.UTC(year, month - 1 - i, 1)
+    );
+
+    months.push(date.toISOString().slice(0, 7));
+  }
+
+  return months;
+}
+
+// ==========================================
+// GET /bookings/admin/analytics
+// Admin: Analytics Dashboard
+// ==========================================
+
+app.get(
+  "/bookings/admin/analytics",
+  verifyJWT,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const collection = getDb().collection("bookings");
+
+      const months = getLastSixMonths();
+
+      const paidFilter = {
+        paymentStatus: "paid",
+        currency: "bdt",
+      };
+
+      // Integer paisa avoids floating-point
+      // accumulation of currency values.
+      // Older records can fall back to totalPrice.
+      const amountInPaisa = {
+        $ifNull: [
+          "$totalPaisa",
+          {
+            $round: [
+              { $multiply: ["$totalPrice", 100] },
+              0,
+            ],
+          },
+        ],
+      };
+
+      const [
+        totalBookings,
+        paidBookings,
+        confirmedRentals,
+        completedRentals,
+        totalRevenueResult,
+        monthlyBookingResult,
+        monthlyPaymentResult,
+        topEquipmentResult,
+        categoryResult,
+      ] = await Promise.all([
+        // All booking records
+        collection.countDocuments({}),
+
+        // Successfully paid bookings
+        collection.countDocuments(paidFilter),
+
+        // Confirmed rentals
+        collection.countDocuments({
+          ...paidFilter,
+          status: "confirmed",
+        }),
+
+        // Completed rentals
+        collection.countDocuments({
+          ...paidFilter,
+          status: "completed",
+        }),
+
+        // ==================================
+        // Gross Paid Amount
+        // ==================================
+
+        collection
+          .aggregate([
+            { $match: paidFilter },
+
+            {
+              $group: {
+                _id: null,
+                totalPaisa: {
+                  $sum: amountInPaisa,
+                },
+              },
+            },
+          ])
+          .toArray(),
+
+        // ==================================
+        // Monthly Booking Activity
+        // Includes all Checkout attempts
+        // ==================================
+
+        collection
+          .aggregate([
+            {
+              $match: {
+                createdAt: { $type: "date" },
+              },
+            },
+
+            {
+              $group: {
+                _id: {
+                  $dateToString: {
+                    format: "%Y-%m",
+                    date: "$createdAt",
+                    timezone: "Asia/Dhaka",
+                  },
+                },
+                bookings: { $sum: 1 },
+              },
+            },
+
+            {
+              $match: {
+                _id: { $in: months },
+              },
+            },
+          ])
+          .toArray(),
+
+        // ==================================
+        // Monthly Paid Bookings and Revenue
+        // Uses paidAt, falling back to createdAt
+        // ==================================
+
+        collection
+          .aggregate([
+            { $match: paidFilter },
+
+            {
+              $project: {
+                month: {
+                  $dateToString: {
+                    format: "%Y-%m",
+                    date: {
+                      $ifNull: [
+                        "$paidAt",
+                        "$createdAt",
+                      ],
+                    },
+                    timezone: "Asia/Dhaka",
+                  },
+                },
+                amount: amountInPaisa,
+              },
+            },
+
+            {
+              $group: {
+                _id: "$month",
+                paidBookings: { $sum: 1 },
+                grossPaisa: { $sum: "$amount" },
+              },
+            },
+
+            {
+              $match: {
+                _id: { $in: months },
+              },
+            },
+          ])
+          .toArray(),
+
+        // ==================================
+        // Top 5 Rented Equipment
+        // Paid bookings only
+        // ==================================
+
+        collection
+          .aggregate([
+            { $match: paidFilter },
+
+            {
+              $group: {
+                _id: "$equipmentId",
+                name: { $first: "$equipmentName" },
+                paidBookings: { $sum: 1 },
+                unitsRented: { $sum: "$quantity" },
+                grossPaisa: { $sum: amountInPaisa },
+              },
+            },
+
+            {
+              $sort: {
+                paidBookings: -1,
+                unitsRented: -1,
+              },
+            },
+
+            { $limit: 5 },
+          ])
+          .toArray(),
+
+        // ==================================
+        // Equipment Category Performance
+        // Join bookings with equipment
+        // ==================================
+
+        collection
+          .aggregate([
+            { $match: paidFilter },
+
+            {
+              $lookup: {
+                from: "equipment",
+                localField: "equipmentId",
+                foreignField: "_id",
+                as: "equipment",
+              },
+            },
+
+            {
+              $unwind: {
+                path: "$equipment",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+
+            {
+              $project: {
+                categories: {
+                  $cond: [
+                    {
+                      $gt: [
+                        {
+                          $size: {
+                            $ifNull: [
+                              "$equipment.categories",
+                              [],
+                            ],
+                          },
+                        },
+                        0,
+                      ],
+                    },
+                    "$equipment.categories",
+                    ["Uncategorized"],
+                  ],
+                },
+
+                unitsRented: "$quantity",
+              },
+            },
+
+            { $unwind: "$categories" },
+
+            {
+              $group: {
+                _id: "$categories",
+                paidBookings: { $sum: 1 },
+                unitsRented: { $sum: "$unitsRented" },
+              },
+            },
+
+            {
+              $sort: {
+                paidBookings: -1,
+                _id: 1,
+              },
+            },
+
+            { $limit: 8 },
+          ])
+          .toArray(),
+      ]);
+
+      // ==================================
+      // Fill missing months with zero values
+      // ==================================
+
+      const bookingMap = new Map(
+        monthlyBookingResult.map((item) => [
+          item._id,
+          item,
+        ])
+      );
+
+      const paymentMap = new Map(
+        monthlyPaymentResult.map((item) => [
+          item._id,
+          item,
+        ])
+      );
+
+      const monthly = months.map((month) => {
+        const booking = bookingMap.get(month);
+        const payment = paymentMap.get(month);
+
+        return {
+          month,
+          bookings: booking?.bookings || 0,
+          paidBookings: payment?.paidBookings || 0,
+          grossPaidAmount:
+            (payment?.grossPaisa || 0) / 100,
+        };
+      });
+
+      // ==================================
+      // Response
+      // ==================================
+
+      return res.status(200).json({
+        success: true,
+
+        stats: {
+          totalBookings,
+          paidBookings,
+          confirmedRentals,
+          completedRentals,
+
+          grossPaidAmount:
+            (totalRevenueResult[0]?.totalPaisa || 0) /
+            100,
+        },
+
+        monthly,
+
+        topEquipment: topEquipmentResult.map(
+          (item) => ({
+            equipmentId: item._id?.toString() || "",
+            name: item.name || "Unknown equipment",
+            paidBookings: item.paidBookings,
+            unitsRented: item.unitsRented,
+            grossPaidAmount:
+              (item.grossPaisa || 0) / 100,
+          })
+        ),
+
+        categories: categoryResult.map((item) => ({
+          name: item._id,
+          paidBookings: item.paidBookings,
+          unitsRented: item.unitsRented,
+        })),
+      });
+    } catch (error) {
+      console.error(
+        "Admin analytics error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Unable to load analytics.",
+      });
+    }
+  }
+);
+
+
 }
