@@ -402,6 +402,7 @@ async function startServer() {
 
     await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
     await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
+    await db.collection("equipment").createIndex({status: 1,createdAt: -1,});
 
     console.log("MongoDB connected successfully");
 
@@ -893,5 +894,172 @@ app.patch(
     }
   },
 );
+
+// ======================================
+// GET /equipment
+// Public: Approved equipment only
+// ======================================
+
+app.get("/equipment", async (req, res) => {
+  try {
+    const getQuery = (key) =>
+      typeof req.query[key] === "string" ? req.query[key].trim() : "";
+
+    const search = getQuery("q").slice(0, 100);
+    const category = getQuery("category");
+    const division = getQuery("division");
+    const condition = getQuery("condition");
+    const sort = getQuery("sort");
+
+    const requestedPage = Number(getQuery("page") || 1);
+
+    const page =
+      Number.isSafeInteger(requestedPage) && requestedPage > 0
+        ? Math.min(requestedPage, 100000)
+        : 1;
+
+    const limit = 9;
+
+    // ==================================
+    // Only approved equipment is public
+    // ==================================
+
+    const filter = {
+      status: "approved",
+    };
+
+    // Search by equipment name
+    if (search) {
+      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      filter.name = {
+        $regex: escapedSearch,
+        $options: "i",
+      };
+    }
+
+    // Match equipment category
+    if (category && allowedCategories.includes(category)) {
+      filter.categories = category;
+    }
+
+    // Match rental division
+    if (division && allowedDivisions.includes(division)) {
+      filter.divisions = division;
+    }
+
+    // Match condition
+    if (condition && allowedConditions.includes(condition)) {
+      filter.condition = condition;
+    }
+
+    // ==================================
+    // Price Filters
+    // ==================================
+
+    const minPriceText = getQuery("minPrice");
+    const maxPriceText = getQuery("maxPrice");
+
+    const minPrice = Number(minPriceText);
+    const maxPrice = Number(maxPriceText);
+
+    const priceFilter = {};
+
+    if (minPriceText && Number.isFinite(minPrice) && minPrice >= 0) {
+      priceFilter.$gte = minPrice;
+    }
+
+    if (maxPriceText && Number.isFinite(maxPrice) && maxPrice >= 0) {
+      priceFilter.$lte = maxPrice;
+    }
+
+    if (Object.keys(priceFilter).length > 0) {
+      filter.dailyPrice = priceFilter;
+    }
+
+    // ==================================
+    // Sorting
+    // ==================================
+
+    let sortOptions = {
+      createdAt: -1,
+      _id: -1,
+    };
+
+    if (sort === "price-low") {
+      sortOptions = {
+        dailyPrice: 1,
+        _id: -1,
+      };
+    }
+
+    if (sort === "price-high") {
+      sortOptions = {
+        dailyPrice: -1,
+        _id: -1,
+      };
+    }
+
+    if (sort === "oldest") {
+      sortOptions = {
+        createdAt: 1,
+        _id: 1,
+      };
+    }
+
+    // ==================================
+    // MongoDB Query
+    // ==================================
+
+    const collection = db.collection("equipment");
+
+    const [total, documents] = await Promise.all([
+      collection.countDocuments(filter),
+
+      collection
+        .find(filter, {
+          // Public fields only
+          projection: {
+            name: 1,
+            categories: 1,
+            condition: 1,
+            divisions: 1,
+            dailyPrice: 1,
+            quantity: 1,
+            availableQuantity: 1,
+            imageUrls: 1,
+            createdAt: 1,
+          },
+        })
+        .sort(sortOptions)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+
+      equipment: documents.map((item) => ({
+        ...item,
+        _id: item._id.toString(),
+      })),
+
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("Public equipment API error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Unable to load equipment.",
+    });
+  }
+});
 
 startServer();
