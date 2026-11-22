@@ -465,6 +465,13 @@ async function startServer() {
       requireRole,
     });
 
+    registerBookingRoutes(app, {
+      getDb: () => db,
+      getMongoClient: () => client,
+      verifyJWT,
+      requireRole,
+    });
+
     // Create the audit-log collection/index
     // before using user-management transactions.
     await db.collection("adminAuditLogs").createIndex({
