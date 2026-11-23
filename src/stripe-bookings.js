@@ -2,6 +2,7 @@ import express from "express";
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 import { getPlatformSettings } from "./platform-settings.js";
+import { handleFeatureCheckoutWebhook } from "./featured-equipment.js";
 
 // =====================================
 // Configuration
@@ -93,7 +94,7 @@ class BookingError extends Error {
 // Register BEFORE express.json()
 // =====================================
 
-export function registerStripeWebhook(app, getDb) {
+export function registerStripeWebhook(app, getDb, getMongoClient) {
   app.post(
     "/stripe/webhook",
     express.raw({ type: "application/json" }),
@@ -123,8 +124,46 @@ export function registerStripeWebhook(app, getDb) {
         return res.json({ received: true });
       }
 
-      const checkout = event.data.object;
-      const bookingId = checkout.metadata?.bookingId;
+      
+const checkout = event.data.object;
+
+// =====================================
+// FEATURED EQUIPMENT PAYMENT WEBHOOK
+// Handle BEFORE checking rental bookingId
+// =====================================
+
+if (
+  checkout.metadata?.kind ===
+  "equipment_feature"
+) {
+  try {
+    await handleFeatureCheckoutWebhook(
+      getDb(),
+      getMongoClient(),
+      event
+    );
+
+    return res.status(200).json({
+      received: true,
+    });
+  } catch (error) {
+    console.error(
+      "Featured equipment webhook error:",
+      error
+    );
+
+    return res.status(500).send(
+      "Featured payment processing failed"
+    );
+  }
+}
+
+// =====================================
+// EXISTING RENTAL BOOKING WEBHOOK
+// =====================================
+
+const bookingId = checkout.metadata?.bookingId;
+
 
       // Ignore unrelated Stripe test events.
       if (
@@ -157,6 +196,32 @@ export function registerStripeWebhook(app, getDb) {
           booking.stripeSessionId !== checkout.id
         ) {
           return res.status(409).send("Checkout session mismatch");
+        }
+
+        // =====================================
+        // Handle Equipment Feature Payments
+        // =====================================
+
+        const featureCheckout = event.data.object;
+
+        if (featureCheckout.metadata?.kind === "equipment_feature") {
+          try {
+            await handleFeatureCheckoutWebhook(
+              getDb(),
+              getMongoClient(),
+              event,
+            );
+
+            return res.status(200).json({
+              received: true,
+            });
+          } catch (error) {
+            console.error("Featured equipment webhook error:", error);
+
+            // A 500 tells Stripe to retry
+            // this event later.
+            return res.status(500).send("Featured payment processing failed");
+          }
         }
 
         // Verify amount and currency for successful payments.

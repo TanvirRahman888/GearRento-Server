@@ -12,6 +12,8 @@ import { registerAdminUserRoutes } from "./admin-users.js";
 import { registerAdminEquipmentRoutes } from "./admin-equipment.js";
 import { registerPlatformSettingsRoutes } from "./platform-settings.js";
 import { registerOwnerAvailabilityRoutes } from "./owner-availability.js";
+import { registerCustomerRentalHistoryRoutes } from "./customer-rental-history.js";
+import { registerFeaturedEquipmentRoutes } from "./featured-equipment.js";
 
 dotenv.config();
 
@@ -49,7 +51,11 @@ app.use(
 let stripeBookingDb;
 
 // Stripe must receive the raw request body.
-registerStripeWebhook(app, () => stripeBookingDb);
+registerStripeWebhook(
+  app,
+  () => stripeBookingDb,
+  () => client,
+);
 
 // Parse JSON requests
 app.use(express.json({ limit: "100kb" }));
@@ -453,6 +459,29 @@ async function startServer() {
     await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
     await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
     await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
+    await db
+      .collection("bookings")
+      .createIndex({ customerId: 1, paymentStatus: 1, status: 1, endDate: -1 });
+
+    await db
+      .collection("equipmentFeatures")
+      .createIndex({ equipmentId: 1, createdAt: -1 });
+
+    await db.collection("equipmentFeatures").createIndex(
+      { stripeSessionId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          stripeSessionId: {
+            $type: "string",
+          },
+        },
+      },
+    );
+
+    await db
+      .collection("equipment")
+      .createIndex({ status: 1, featureExpiresAt: -1 });
 
     console.log("MongoDB connected successfully");
 
@@ -547,6 +576,18 @@ async function startServer() {
     registerOwnerAvailabilityRoutes(app, {
       getDb: () => db,
       getMongoClient: () => client,
+      verifyJWT,
+      requireRole,
+    });
+
+    registerCustomerRentalHistoryRoutes(app, {
+      getDb: () => db,
+      verifyJWT,
+      requireRole,
+    });
+
+    registerFeaturedEquipmentRoutes(app, {
+      getDb: () => db,
       verifyJWT,
       requireRole,
     });
@@ -904,11 +945,24 @@ app.get(
       const filter = { status: "pending" };
       const collection = db.collection("equipment");
 
+      const now = new Date();
+
+      const featuredSort = ["price-low", "price-high", "oldest"].includes(sort)
+        ? sortOptions
+        : {
+            isFeatured: -1,
+            ...sortOptions,
+          };
+
       const [total, documents] = await Promise.all([
         collection.countDocuments(filter),
+
         collection
           .find(filter)
-          .sort({ createdAt: -1 })
+          .sort({
+            createdAt: -1,
+            _id: -1,
+          })
           .skip((page - 1) * limit)
           .limit(limit)
           .toArray(),
@@ -1158,27 +1212,64 @@ app.get("/equipment", async (req, res) => {
 
     const collection = db.collection("equipment");
 
+    const now = new Date();
+
+    const featuredSort = ["price-low", "price-high", "oldest"].includes(sort)
+      ? sortOptions
+      : {
+          isFeatured: -1,
+          ...sortOptions,
+        };
+
     const [total, documents] = await Promise.all([
       collection.countDocuments(filter),
 
       collection
-        .find(filter, {
-          // Public fields only
-          projection: {
-            name: 1,
-            categories: 1,
-            condition: 1,
-            divisions: 1,
-            dailyPrice: 1,
-            quantity: 1,
-            availableQuantity: 1,
-            imageUrls: 1,
-            createdAt: 1,
+        .aggregate([
+          {
+            $match: filter,
           },
-        })
-        .sort(sortOptions)
-        .skip((page - 1) * limit)
-        .limit(limit)
+          {
+            $addFields: {
+              isFeatured: {
+                $and: [
+                  {
+                    $eq: ["$status", "approved"],
+                  },
+                  {
+                    $gt: ["$featureExpiresAt", now],
+                  },
+                ],
+              },
+            },
+          },
+          {
+            $sort: featuredSort,
+          },
+          {
+            $skip: (page - 1) * limit,
+          },
+          {
+            $limit: limit,
+          },
+          {
+            $project: {
+              name: 1,
+              categories: 1,
+              condition: 1,
+              divisions: 1,
+              dailyPrice: 1,
+              quantity: 1,
+              availableQuantity: 1,
+              imageUrls: 1,
+              createdAt: 1,
+
+              // Featured information
+              isFeatured: 1,
+              featureExpiresAt: 1,
+            },
+          },
+        ])
         .toArray(),
     ]);
 
