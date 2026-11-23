@@ -1117,7 +1117,7 @@ app.get("/equipment", async (req, res) => {
         ? Math.min(requestedPage, 100000)
         : 1;
 
-    const limit = 9;
+    const limit = 12;
 
     // ==================================
     // Only approved equipment is public
@@ -1214,12 +1214,18 @@ app.get("/equipment", async (req, res) => {
 
     const now = new Date();
 
-    const featuredSort = ["price-low", "price-high", "oldest"].includes(sort)
-      ? sortOptions
-      : {
-          isFeatured: -1,
-          ...sortOptions,
-        };
+    const featuredSort =
+      sort === "newest"
+        ? {
+            createdAt: -1,
+            _id: -1,
+          }
+        : ["price-low", "price-high", "oldest"].includes(sort)
+          ? sortOptions
+          : {
+              isFeatured: -1,
+              ...sortOptions,
+            };
 
     const [total, documents] = await Promise.all([
       collection.countDocuments(filter),
