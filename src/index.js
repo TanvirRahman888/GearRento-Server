@@ -4,10 +4,12 @@ import dotenv from "dotenv";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import sanitizeHtml from "sanitize-html";
 import { MongoClient, ObjectId } from "mongodb";
+
 import {
   registerStripeWebhook,
   registerBookingRoutes,
 } from "./stripe-bookings.js";
+
 import { registerAdminUserRoutes } from "./admin-users.js";
 import { registerAdminEquipmentRoutes } from "./admin-equipment.js";
 import { registerPlatformSettingsRoutes } from "./platform-settings.js";
@@ -17,75 +19,182 @@ import { registerFeaturedEquipmentRoutes } from "./featured-equipment.js";
 
 dotenv.config();
 
-// ======================================
-// Express Configuration
-// ======================================
+// ==========================================
+// EXPRESS CONFIGURATION
+// ==========================================
 
 const app = express();
 
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT || 5000);
 
-const CLIENT_URL = process.env.CLIENT_URL;
+const CLIENT_URL = process.env.CLIENT_URL?.replace(/\/+$/, "");
+
 const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL?.replace(/\/+$/, "");
 
-if (!CLIENT_URL || !BETTER_AUTH_URL || !process.env.MONGODB_URI) {
-  throw new Error(
-    "Missing CLIENT_URL, BETTER_AUTH_URL, or MONGODB_URI in .env",
-  );
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = process.env.DB_NAME || "GearRento";
+
+// Avoid crashing the entire serverless function
+// when an environment variable is missing.
+
+if (!CLIENT_URL || !BETTER_AUTH_URL || !MONGODB_URI) {
+  console.warn("GearRento configuration is incomplete:", {
+    hasClientUrl: Boolean(CLIENT_URL),
+    hasBetterAuthUrl: Boolean(BETTER_AUTH_URL),
+    hasMongoUri: Boolean(MONGODB_URI),
+  });
 }
 
-// ======================================
-// Middlewares
-// ======================================
+// ==========================================
+// MONGODB CONFIGURATION
+// ==========================================
 
-// Allow requests from Next.js
+let client = null;
+let db = null;
+let mongoConfigurationError = null;
+
+try {
+  if (MONGODB_URI) {
+    client = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+      maxPoolSize: 10,
+    });
+
+    db = client.db(DB_NAME);
+  }
+} catch (error) {
+  mongoConfigurationError = error;
+
+  console.error("Invalid MongoDB configuration:", error?.message);
+}
+
+// ==========================================
+// REUSABLE MONGODB CONNECTION
+// ==========================================
+
+let mongoConnectionPromise;
+
+async function connectDatabase() {
+  if (!client || !db) {
+    throw mongoConfigurationError || new Error("MONGODB_URI is missing.");
+  }
+
+  if (!mongoConnectionPromise) {
+    mongoConnectionPromise = client
+      .connect()
+      .then(() => {
+        console.log("GearRento MongoDB connected successfully");
+
+        return db;
+      })
+      .catch((error) => {
+        mongoConnectionPromise = undefined;
+
+        throw error;
+      });
+  }
+
+  return mongoConnectionPromise;
+}
+
+// ==========================================
+// CORS MIDDLEWARE
+// ==========================================
+
 app.use(
   cors({
-    origin: CLIENT_URL,
+    origin: CLIENT_URL || false,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 
-let stripeBookingDb;
+// ==========================================
+// HEALTH CHECK
+// ==========================================
 
-// Stripe must receive the raw request body.
+// Health checks do not require MongoDB.
+// Useful for diagnosing Vercel deployments.
+
+function sendHealth(req, res) {
+  return res.status(200).json({
+    success: true,
+    message: "GearRento API is running",
+  });
+}
+
+app.get("/", sendHealth);
+app.get("/health", sendHealth);
+
+// ==========================================
+// DATABASE CONNECTION MIDDLEWARE
+// ==========================================
+
+// Connect MongoDB before processing database
+// dependent routes.
+//
+// This does not modify request bodies, so
+// Stripe webhook signature checking still works.
+
+app.use(async (req, res, next) => {
+  try {
+    await connectDatabase();
+
+    next();
+  } catch (error) {
+    console.error("MongoDB connection failed:", {
+      name: error?.name,
+      code: error?.code,
+      message: error?.message,
+    });
+
+    return res.status(503).json({
+      success: false,
+      error: "Database temporarily unavailable.",
+    });
+  }
+});
+
+// ==========================================
+// STRIPE WEBHOOK
+// ==========================================
+
+// IMPORTANT:
+// Register Stripe webhook before express.json().
+// The Stripe webhook needs the raw request body.
+
 registerStripeWebhook(
   app,
-  () => stripeBookingDb,
+  () => db,
   () => client,
 );
 
-// Parse JSON requests
+// ==========================================
+// JSON MIDDLEWARE
+// ==========================================
+
 app.use(express.json({ limit: "100kb" }));
 
-// ======================================
-// MongoDB Configuration
-// ======================================
+// ==========================================
+// BETTER AUTH JWT CONFIGURATION
+// ==========================================
 
-const client = new MongoClient(process.env.MONGODB_URI);
+let JWKS = null;
 
-const db = client.db(process.env.DB_NAME || "GearRento");
+try {
+  if (BETTER_AUTH_URL) {
+    JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_URL}/api/auth/jwks`));
+  }
+} catch (error) {
+  console.error("Invalid Better Auth URL:", error?.message);
+}
 
-// ======================================
-// Better Auth JWT Verification
-// ======================================
-
-// Better Auth exposes its public signing keys
-// through the JWKS endpoint.
-
-const jwksURL = new URL(`${BETTER_AUTH_URL}/api/auth/jwks`);
-
-// Cache the JWKS verifier
-const JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_URL}/api/auth/jwks`));
-
-// ======================================
-// JWT Authentication Middleware
-// ======================================
+// ==========================================
+// JWT AUTHENTICATION MIDDLEWARE
+// ==========================================
 
 async function verifyJWT(req, res, next) {
-  // Read Authorization header
   const authorization = req.get("Authorization") || "";
 
   const match = authorization.match(/^Bearer (.+)$/i);
@@ -97,8 +206,14 @@ async function verifyJWT(req, res, next) {
     });
   }
 
+  if (!JWKS) {
+    return res.status(503).json({
+      success: false,
+      error: "Authentication provider is not configured.",
+    });
+  }
+
   try {
-    // Verify signature, issuer, audience and expiry
     const { payload } = await jwtVerify(match[1], JWKS, {
       issuer: BETTER_AUTH_URL,
       audience: BETTER_AUTH_URL,
@@ -106,7 +221,8 @@ async function verifyJWT(req, res, next) {
       requiredClaims: ["sub", "exp"],
     });
 
-    // Verify user identity
+    // Validate user identity
+
     if (typeof payload.sub !== "string" || !payload.sub) {
       return res.status(401).json({
         success: false,
@@ -114,12 +230,11 @@ async function verifyJWT(req, res, next) {
       });
     }
 
-    // Only recognize supported roles
-    if (
-      payload.role !== "admin" &&
-      payload.role !== "owner" &&
-      payload.role !== "customer"
-    ) {
+    // Validate supported roles
+
+    const supportedRoles = ["admin", "owner", "customer"];
+
+    if (!supportedRoles.includes(payload.role)) {
       return res.status(403).json({
         success: false,
         error: "Invalid user role.",
@@ -127,7 +242,7 @@ async function verifyJWT(req, res, next) {
     }
 
     // ======================================
-    // Verify user's current database role
+    // VERIFY CURRENT DATABASE ROLE
     // ======================================
 
     const idCandidates = [payload.sub];
@@ -164,6 +279,8 @@ async function verifyJWT(req, res, next) {
       });
     }
 
+    // Attach authenticated user
+
     req.authUser = {
       id: payload.sub,
       role: storedUser.role,
@@ -184,9 +301,9 @@ async function verifyJWT(req, res, next) {
   }
 }
 
-// ======================================
-// Role Authorization Middleware
-// ======================================
+// ==========================================
+// ROLE AUTHORIZATION MIDDLEWARE
+// ==========================================
 
 function requireRole(...allowedRoles) {
   return (req, res, next) => {
@@ -208,20 +325,9 @@ function requireRole(...allowedRoles) {
   };
 }
 
-// ======================================
-// API Health Check
-// ======================================
-
-app.get("/", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "GearRento API is running",
-  });
-});
-
-// ======================================
-// Equipment Categories
-// ======================================
+// ==========================================
+// EQUIPMENT CATEGORIES
+// ==========================================
 
 const allowedCategories = [
   "Photography",
@@ -240,9 +346,9 @@ const allowedCategories = [
   "Automotive",
 ];
 
-// ======================================
-// Bangladesh Divisions
-// ======================================
+// ==========================================
+// BANGLADESH DIVISIONS
+// ==========================================
 
 const allowedDivisions = [
   "Dhaka",
@@ -255,9 +361,9 @@ const allowedDivisions = [
   "Mymensingh",
 ];
 
-// ======================================
-// Equipment Conditions
-// ======================================
+// ==========================================
+// EQUIPMENT CONDITIONS
+// ==========================================
 
 const allowedConditions = [
   "new",
@@ -270,9 +376,9 @@ const allowedConditions = [
   "used-tested",
 ];
 
-// ======================================
-// Validate Equipment Image URL
-// ======================================
+// ==========================================
+// EQUIPMENT HELPERS
+// ==========================================
 
 function validImageUrl(value) {
   if (typeof value !== "string" || value.length > 1000) {
@@ -288,10 +394,51 @@ function validImageUrl(value) {
   }
 }
 
-// ======================================
+function cleanEquipmentDescription(html) {
+  return sanitizeHtml(html, {
+    allowedTags: [
+      "p",
+      "strong",
+      "em",
+      "s",
+      "h2",
+      "h3",
+      "ul",
+      "ol",
+      "li",
+      "blockquote",
+      "br",
+    ],
+    allowedAttributes: {},
+  });
+}
+
+function getPlainDescription(html) {
+  return sanitizeHtml(html, {
+    allowedTags: [],
+    allowedAttributes: {},
+  })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getOwnerEquipmentFilter(req) {
+  const id = req.params.id;
+
+  if (!/^[a-f0-9]{24}$/i.test(id)) {
+    return null;
+  }
+
+  return {
+    _id: new ObjectId(id),
+    ownerId: req.authUser.id,
+  };
+}
+
+// ==========================================
 // POST /equipment/add
-// Protected: Owner Only
-// ======================================
+// OWNER ONLY
+// ==========================================
 
 app.post(
   "/equipment/add",
@@ -308,10 +455,6 @@ app.post(
       dailyPrice,
       quantity,
     } = req.body ?? {};
-
-    // ==================================
-    // Validate Equipment Fields
-    // ==================================
 
     const valid =
       typeof name === "string" &&
@@ -347,34 +490,9 @@ app.post(
       });
     }
 
-    // ==================================
-    // Sanitize Rich Text Description
-    // ==================================
+    const cleanDescription = cleanEquipmentDescription(descriptionHtml);
 
-    const cleanDescription = sanitizeHtml(descriptionHtml, {
-      allowedTags: [
-        "p",
-        "strong",
-        "em",
-        "s",
-        "h2",
-        "h3",
-        "ul",
-        "ol",
-        "li",
-        "blockquote",
-        "br",
-      ],
-      allowedAttributes: {},
-    });
-
-    // Strip HTML to validate text length
-    const plainDescription = sanitizeHtml(cleanDescription, {
-      allowedTags: [],
-      allowedAttributes: {},
-    })
-      .replace(/\s+/g, " ")
-      .trim();
+    const plainDescription = getPlainDescription(cleanDescription);
 
     if (plainDescription.length < 20 || plainDescription.length > 3000) {
       return res.status(400).json({
@@ -383,42 +501,26 @@ app.post(
       });
     }
 
-    // ==================================
-    // Save Equipment to MongoDB
-    // ==================================
-
     try {
       const now = new Date();
 
       const equipment = {
         name: name.trim(),
 
-        // Multiple categories
         categories: [...new Set(categories)],
-
-        // Equipment condition
         condition,
-
-        // Multiple rental divisions
         divisions: [...new Set(divisions)],
 
-        // Sanitized rich-text description
         descriptionHtml: cleanDescription,
 
-        // Maximum 5 images
         imageUrls: imageUrls.map((url) => url.trim()),
 
-        // Rental price
         dailyPrice,
-
-        // Inventory
         quantity,
         availableQuantity: quantity,
 
-        // Owner ID from verified JWT
         ownerId: req.authUser.id,
 
-        // Admin approval
         status: "pending",
 
         createdAt: now,
@@ -443,168 +545,167 @@ app.post(
   },
 );
 
-// ======================================
-// Start Express Server
-// ======================================
+// ==========================================
+// REGISTER BACKEND ROUTE MODULES
+// ==========================================
 
-async function startServer() {
-  try {
-    await client.connect();
+// Register routes synchronously so Vercel
+// can handle incoming requests correctly.
 
-    // Preserve your existing unique index
-    await db
-      .collection("ownerRequests")
-      .createIndex({ userId: 1 }, { unique: true });
+const routeDependencies = {
+  getDb: () => db,
+  getMongoClient: () => client,
+  verifyJWT,
+  requireRole,
+};
 
-    await db.collection("equipment").createIndex({ ownerId: 1, createdAt: -1 });
-    await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
-    await db.collection("equipment").createIndex({ status: 1, createdAt: -1 });
-    await db
-      .collection("bookings")
-      .createIndex({ customerId: 1, paymentStatus: 1, status: 1, endDate: -1 });
+if (db) {
+  registerAdminUserRoutes(app, routeDependencies);
 
-    await db
-      .collection("equipmentFeatures")
-      .createIndex({ equipmentId: 1, createdAt: -1 });
+  registerBookingRoutes(app, routeDependencies);
 
-    await db.collection("equipmentFeatures").createIndex(
-      { stripeSessionId: 1 },
-      {
-        unique: true,
-        partialFilterExpression: {
-          stripeSessionId: {
-            $type: "string",
-          },
-        },
-      },
-    );
+  registerAdminEquipmentRoutes(app, routeDependencies);
 
-    await db
-      .collection("equipment")
-      .createIndex({ status: 1, featureExpiresAt: -1 });
+  registerPlatformSettingsRoutes(app, routeDependencies);
 
-    console.log("MongoDB connected successfully");
+  registerOwnerAvailabilityRoutes(app, routeDependencies);
 
-    // stripeBookingDb############
+  registerCustomerRentalHistoryRoutes(app, routeDependencies);
 
-    stripeBookingDb = db;
-
-    registerAdminUserRoutes(app, {
-      getDb: () => db,
-      getMongoClient: () => client,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerBookingRoutes(app, {
-      getDb: () => db,
-      getMongoClient: () => client,
-      verifyJWT,
-      requireRole,
-    });
-
-    // Create the audit-log collection/index
-    // before using user-management transactions.
-    await db.collection("adminAuditLogs").createIndex({
-      actorId: 1,
-      createdAt: -1,
-    });
-
-    await db.collection("bookings").createIndex({
-      equipmentId: 1,
-      status: 1,
-      startDate: 1,
-      endDate: 1,
-    });
-
-    await db.collection("bookings").createIndex({
-      customerId: 1,
-      createdAt: -1,
-    });
-
-    await db.collection("bookings").createIndex(
-      {
-        stripeSessionId: 1,
-      },
-      {
-        unique: true,
-        partialFilterExpression: {
-          stripeSessionId: {
-            $type: "string",
-          },
-        },
-      },
-    );
-
-    await db.collection("bookings").createIndex({
-      ownerId: 1,
-      paymentStatus: 1,
-      status: 1,
-      createdAt: -1,
-    });
-
-    await db.collection("bookings").createIndex({
-      status: 1,
-      paymentStatus: 1,
-      createdAt: -1,
-    });
-
-    await db.collection("bookings").createIndex({
-      createdAt: -1,
-    });
-
-    // New Admin user management routes
-    registerAdminUserRoutes(app, {
-      getDb: () => db,
-      getMongoClient: () => client,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerAdminEquipmentRoutes(app, {
-      getDb: () => db,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerPlatformSettingsRoutes(app, {
-      getDb: () => db,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerOwnerAvailabilityRoutes(app, {
-      getDb: () => db,
-      getMongoClient: () => client,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerCustomerRentalHistoryRoutes(app, {
-      getDb: () => db,
-      verifyJWT,
-      requireRole,
-    });
-
-    registerFeaturedEquipmentRoutes(app, {
-      getDb: () => db,
-      verifyJWT,
-      requireRole,
-    });
-
-    app.listen(PORT, () => {
-      console.log(`GearRento server running on port ${PORT}`);
-    });
-  } catch (error) {
-    console.error("Server startup failed:", error);
-    process.exit(1);
-  }
+  registerFeaturedEquipmentRoutes(app, routeDependencies);
+} else {
+  console.error(
+    "Equipment and booking routes unavailable: MongoDB is not configured.",
+  );
 }
 
-// ======================================
+// ==========================================
+// DATABASE INDEXES
+// ==========================================
+
+// MongoDB indexes are initialized during
+// local startup, not on every Vercel request.
+//
+// Ensure these indexes exist in Atlas before
+// relying on them in production.
+
+async function ensureIndexes() {
+  if (!db) {
+    throw new Error("MongoDB is not configured.");
+  }
+
+  const ownerRequests = db.collection("ownerRequests");
+  const equipment = db.collection("equipment");
+  const bookings = db.collection("bookings");
+
+  const equipmentFeatures = db.collection("equipmentFeatures");
+
+  // Owner request index
+
+  await ownerRequests.createIndex({ userId: 1 }, { unique: true });
+
+  // Equipment indexes
+
+  await equipment.createIndex({
+    ownerId: 1,
+    createdAt: -1,
+  });
+
+  await equipment.createIndex({
+    status: 1,
+    createdAt: -1,
+  });
+
+  await equipment.createIndex({
+    status: 1,
+    featureExpiresAt: -1,
+  });
+
+  // Booking indexes
+
+  await bookings.createIndex({
+    customerId: 1,
+    paymentStatus: 1,
+    status: 1,
+    endDate: -1,
+  });
+
+  await bookings.createIndex({
+    equipmentId: 1,
+    status: 1,
+    startDate: 1,
+    endDate: 1,
+  });
+
+  await bookings.createIndex({
+    customerId: 1,
+    createdAt: -1,
+  });
+
+  await bookings.createIndex({
+    ownerId: 1,
+    paymentStatus: 1,
+    status: 1,
+    createdAt: -1,
+  });
+
+  await bookings.createIndex({
+    status: 1,
+    paymentStatus: 1,
+    createdAt: -1,
+  });
+
+  await bookings.createIndex({
+    createdAt: -1,
+  });
+
+  await bookings.createIndex(
+    {
+      stripeSessionId: 1,
+    },
+    {
+      unique: true,
+      partialFilterExpression: {
+        stripeSessionId: {
+          $type: "string",
+        },
+      },
+    },
+  );
+
+  // Featured equipment indexes
+
+  await equipmentFeatures.createIndex({
+    equipmentId: 1,
+    createdAt: -1,
+  });
+
+  await equipmentFeatures.createIndex(
+    {
+      stripeSessionId: 1,
+    },
+    {
+      unique: true,
+      partialFilterExpression: {
+        stripeSessionId: {
+          $type: "string",
+        },
+      },
+    },
+  );
+
+  // Admin audit logs
+
+  await db.collection("adminAuditLogs").createIndex({
+    actorId: 1,
+    createdAt: -1,
+  });
+}
+
+// ==========================================
 // GET /equipment/mine
-// Protected: Owner Only
-// ======================================
+// OWNER ONLY
+// ==========================================
 
 app.get(
   "/equipment/mine",
@@ -612,11 +713,10 @@ app.get(
   requireRole("owner"),
   async (req, res) => {
     try {
-      // Owner ID comes from the verified JWT
       const ownerId = req.authUser.id;
 
-      // Pagination: 9 equipment listings per page
       const requestedPage = Number(req.query.page);
+
       const page =
         Number.isSafeInteger(requestedPage) && requestedPage > 0
           ? requestedPage
@@ -627,7 +727,6 @@ app.get(
 
       const collection = db.collection("equipment");
 
-      // Only fetch equipment belonging to this owner
       const filter = { ownerId };
 
       const [total, equipment] = await Promise.all([
@@ -671,57 +770,10 @@ app.get(
   },
 );
 
-// ======================================
-// Shared Equipment Helpers
-// ======================================
-
-function getOwnerEquipmentFilter(req) {
-  const id = req.params.id;
-
-  if (!/^[a-f0-9]{24}$/i.test(id)) {
-    return null;
-  }
-
-  return {
-    _id: new ObjectId(id),
-
-    // Owner ID comes from verified JWT
-    ownerId: req.authUser.id,
-  };
-}
-
-function cleanEquipmentDescription(html) {
-  return sanitizeHtml(html, {
-    allowedTags: [
-      "p",
-      "strong",
-      "em",
-      "s",
-      "h2",
-      "h3",
-      "ul",
-      "ol",
-      "li",
-      "blockquote",
-      "br",
-    ],
-    allowedAttributes: {},
-  });
-}
-
-function getPlainDescription(html) {
-  return sanitizeHtml(html, {
-    allowedTags: [],
-    allowedAttributes: {},
-  })
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// ======================================
+// ==========================================
 // GET /equipment/mine/:id
-// View One Owner Equipment
-// ======================================
+// OWNER ONLY
+// ==========================================
 
 app.get(
   "/equipment/mine/:id",
@@ -745,13 +797,13 @@ app.get(
         });
       }
 
-      // Sanitize again before rendering as HTML
       const cleanDescription = cleanEquipmentDescription(
         equipment.descriptionHtml || "",
       );
 
       return res.status(200).json({
         success: true,
+
         equipment: {
           ...equipment,
           _id: equipment._id.toString(),
@@ -769,10 +821,10 @@ app.get(
   },
 );
 
-// ======================================
+// ==========================================
 // PATCH /equipment/mine/:id
-// Update Owner Equipment
-// ======================================
+// OWNER ONLY
+// ==========================================
 
 app.patch(
   "/equipment/mine/:id",
@@ -798,7 +850,6 @@ app.patch(
       quantity,
     } = req.body ?? {};
 
-    // Same validation rules as Add Equipment
     const valid =
       typeof name === "string" &&
       name.trim().length >= 3 &&
@@ -853,11 +904,7 @@ app.patch(
           imageUrls: imageUrls.map((url) => url.trim()),
           dailyPrice,
           quantity,
-
-          // Safe only while there are no active bookings
           availableQuantity: quantity,
-
-          // Require fresh approval after changes
           status: "pending",
           updatedAt: new Date(),
         },
@@ -883,10 +930,10 @@ app.patch(
   },
 );
 
-// ======================================
+// ==========================================
 // DELETE /equipment/mine/:id
-// Delete Owner Equipment
-// ======================================
+// OWNER ONLY
+// ==========================================
 
 app.delete(
   "/equipment/mine/:id",
@@ -924,10 +971,10 @@ app.delete(
   },
 );
 
-// ======================================
-// ADMIN: Get Pending Equipment
+// ==========================================
 // GET /equipment/pending
-// ======================================
+// ADMIN ONLY
+// ==========================================
 
 app.get(
   "/equipment/pending",
@@ -936,23 +983,19 @@ app.get(
   async (req, res) => {
     try {
       const requestedPage = Number(req.query.page ?? 1);
+
       const page =
         Number.isSafeInteger(requestedPage) && requestedPage >= 1
           ? requestedPage
           : 1;
 
       const limit = 10;
-      const filter = { status: "pending" };
+
+      const filter = {
+        status: "pending",
+      };
+
       const collection = db.collection("equipment");
-
-      const now = new Date();
-
-      const featuredSort = ["price-low", "price-high", "oldest"].includes(sort)
-        ? sortOptions
-        : {
-            isFeatured: -1,
-            ...sortOptions,
-          };
 
       const [total, documents] = await Promise.all([
         collection.countDocuments(filter),
@@ -981,16 +1024,16 @@ app.get(
         status: item.status,
         createdAt: item.createdAt,
 
-        // Send plain text to the Admin UI
         descriptionText: sanitizeHtml(item.descriptionHtml || "", {
           allowedTags: [],
           allowedAttributes: {},
         }).trim(),
       }));
 
-      return res.json({
+      return res.status(200).json({
         success: true,
         equipment,
+
         pagination: {
           page,
           limit,
@@ -1002,16 +1045,17 @@ app.get(
       console.error("Pending equipment error:", error);
 
       return res.status(500).json({
+        success: false,
         error: "Unable to load pending equipment.",
       });
     }
   },
 );
 
-// ======================================
-// ADMIN: Approve or Reject Equipment
+// ==========================================
 // PATCH /equipment/review/:id
-// ======================================
+// ADMIN ONLY
+// ==========================================
 
 app.patch(
   "/equipment/review/:id",
@@ -1019,9 +1063,9 @@ app.patch(
   requireRole("admin"),
   async (req, res) => {
     const { id } = req.params;
+
     const { decision, reason } = req.body ?? {};
 
-    // Validate MongoDB ObjectId
     if (!/^[a-f0-9]{24}$/i.test(id)) {
       return res.status(400).json({
         error: "Invalid equipment ID.",
@@ -1036,7 +1080,6 @@ app.patch(
 
     const reviewReason = typeof reason === "string" ? reason.trim() : "";
 
-    // Rejection needs an explanation
     if (
       decision === "reject" &&
       (reviewReason.length < 5 || reviewReason.length > 500)
@@ -1066,9 +1109,9 @@ app.patch(
       );
 
       if (result.matchedCount === 0) {
-        const exists = await db
-          .collection("equipment")
-          .findOne({ _id: new ObjectId(id) });
+        const exists = await db.collection("equipment").findOne({
+          _id: new ObjectId(id),
+        });
 
         return res.status(exists ? 409 : 404).json({
           error: exists
@@ -1077,7 +1120,7 @@ app.patch(
         });
       }
 
-      return res.json({
+      return res.status(200).json({
         success: true,
         message:
           decision === "approve"
@@ -1094,10 +1137,10 @@ app.patch(
   },
 );
 
-// ======================================
+// ==========================================
 // GET /equipment
-// Public: Approved equipment only
-// ======================================
+// PUBLIC EQUIPMENT LIST
+// ==========================================
 
 app.get("/equipment", async (req, res) => {
   try {
@@ -1105,6 +1148,7 @@ app.get("/equipment", async (req, res) => {
       typeof req.query[key] === "string" ? req.query[key].trim() : "";
 
     const search = getQuery("q").slice(0, 100);
+
     const category = getQuery("category");
     const division = getQuery("division");
     const condition = getQuery("condition");
@@ -1119,15 +1163,16 @@ app.get("/equipment", async (req, res) => {
 
     const limit = 12;
 
-    // ==================================
-    // Only approved equipment is public
-    // ==================================
+    // ======================================
+    // FILTER APPROVED EQUIPMENT
+    // ======================================
 
     const filter = {
       status: "approved",
     };
 
-    // Search by equipment name
+    // Search equipment names
+
     if (search) {
       const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -1137,24 +1182,27 @@ app.get("/equipment", async (req, res) => {
       };
     }
 
-    // Match equipment category
+    // Category filter
+
     if (category && allowedCategories.includes(category)) {
       filter.categories = category;
     }
 
-    // Match rental division
+    // Division filter
+
     if (division && allowedDivisions.includes(division)) {
       filter.divisions = division;
     }
 
-    // Match condition
+    // Condition filter
+
     if (condition && allowedConditions.includes(condition)) {
       filter.condition = condition;
     }
 
-    // ==================================
-    // Price Filters
-    // ==================================
+    // ======================================
+    // PRICE FILTERS
+    // ======================================
 
     const minPriceText = getQuery("minPrice");
     const maxPriceText = getQuery("maxPrice");
@@ -1176,9 +1224,9 @@ app.get("/equipment", async (req, res) => {
       filter.dailyPrice = priceFilter;
     }
 
-    // ==================================
-    // Sorting
-    // ==================================
+    // ======================================
+    // SORTING
+    // ======================================
 
     let sortOptions = {
       createdAt: -1,
@@ -1206,9 +1254,9 @@ app.get("/equipment", async (req, res) => {
       };
     }
 
-    // ==================================
-    // MongoDB Query
-    // ==================================
+    // ======================================
+    // FEATURED SORTING
+    // ======================================
 
     const collection = db.collection("equipment");
 
@@ -1226,6 +1274,10 @@ app.get("/equipment", async (req, res) => {
               isFeatured: -1,
               ...sortOptions,
             };
+
+    // ======================================
+    // MONGODB QUERY
+    // ======================================
 
     const [total, documents] = await Promise.all([
       collection.countDocuments(filter),
@@ -1269,8 +1321,6 @@ app.get("/equipment", async (req, res) => {
               availableQuantity: 1,
               imageUrls: 1,
               createdAt: 1,
-
-              // Featured information
               isFeatured: 1,
               featureExpiresAt: 1,
             },
@@ -1304,16 +1354,14 @@ app.get("/equipment", async (req, res) => {
   }
 });
 
-// ======================================
+// ==========================================
 // GET /equipment/:id
-// Public Equipment Details
-// Approved Equipment Only
-// ======================================
+// PUBLIC EQUIPMENT DETAILS
+// ==========================================
 
 app.get("/equipment/:id", async (req, res) => {
   const { id } = req.params;
 
-  // Validate MongoDB ObjectId
   if (!/^[a-f0-9]{24}$/i.test(id)) {
     return res.status(404).json({
       success: false,
@@ -1350,26 +1398,13 @@ app.get("/equipment/:id", async (req, res) => {
       });
     }
 
-    // Sanitize rich-text HTML before public display
-    const cleanDescription = sanitizeHtml(equipment.descriptionHtml || "", {
-      allowedTags: [
-        "p",
-        "strong",
-        "em",
-        "s",
-        "h2",
-        "h3",
-        "ul",
-        "ol",
-        "li",
-        "blockquote",
-        "br",
-      ],
-      allowedAttributes: {},
-    });
+    const cleanDescription = cleanEquipmentDescription(
+      equipment.descriptionHtml || "",
+    );
 
     return res.status(200).json({
       success: true,
+
       equipment: {
         ...equipment,
         _id: equipment._id.toString(),
@@ -1386,4 +1421,34 @@ app.get("/equipment/:id", async (req, res) => {
   }
 });
 
-startServer();
+// ==========================================
+// VERCEL EXPRESS EXPORT
+// ==========================================
+
+// Vercel uses the exported Express app.
+// No app.listen() is required on Vercel.
+
+export default app;
+
+// ==========================================
+// LOCAL DEVELOPMENT SERVER
+// ==========================================
+
+if (!process.env.VERCEL) {
+  (async () => {
+    // Connect MongoDB locally
+    await connectDatabase();
+
+    // Create required MongoDB indexes
+    await ensureIndexes();
+
+    // Start local HTTP server
+    app.listen(PORT, () => {
+      console.log(`GearRento API running at http://localhost:${PORT}`);
+    });
+  })().catch((error) => {
+    console.error("Local GearRento startup failed:", error);
+
+    process.exitCode = 1;
+  });
+}
