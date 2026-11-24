@@ -1,15 +1,30 @@
+
 {
   "name": "gearrento-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
-  },
-  "keywords": [],
+  "description": "GearRento Equipment Rental Marketplace Backend API",
+  "private": true,
   "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "check": "node --check src/index.js",
+    "test": "echo \"No tests configured yet\""
+  },
+  "keywords": [
+    "gearrento",
+    "equipment-rental",
+    "express",
+    "mongodb",
+    "stripe",
+    "better-auth",
+    "vercel"
+  ],
+  "license": "UNLICENSED",
   "dependencies": {
     "@better-auth/mongo-adapter": "^1.7.26",
     "better-auth": "^1.7.26",
