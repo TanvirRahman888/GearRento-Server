@@ -16,6 +16,7 @@ import { registerPlatformSettingsRoutes } from "./platform-settings.js";
 import { registerOwnerAvailabilityRoutes } from "./owner-availability.js";
 import { registerCustomerRentalHistoryRoutes } from "./customer-rental-history.js";
 import { registerFeaturedEquipmentRoutes } from "./featured-equipment.js";
+import { registerFavoriteRoutes } from "./favorites.js";
 
 dotenv.config();
 
@@ -573,6 +574,8 @@ if (db) {
   registerCustomerRentalHistoryRoutes(app, routeDependencies);
 
   registerFeaturedEquipmentRoutes(app, routeDependencies);
+
+  registerFavoriteRoutes(app, routeDependencies);
 } else {
   console.error(
     "Equipment and booking routes unavailable: MongoDB is not configured.",
@@ -679,6 +682,17 @@ async function ensureIndexes() {
     equipmentId: 1,
     createdAt: -1,
   });
+
+  await db.collection("favorites").createIndex(
+  {
+    customerId: 1,
+    equipmentId: 1,
+  },
+  {
+    unique: true,
+    name: "unique_customer_equipment",
+  }
+);
 
   await equipmentFeatures.createIndex(
     {
