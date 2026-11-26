@@ -749,7 +749,15 @@ app.get(
 
         equipment: equipment.map((item) => ({
           ...item,
+
           _id: item._id.toString(),
+
+          isFeatured:
+            item.status === "approved" &&
+            item.featureExpiresAt instanceof Date &&
+            item.featureExpiresAt.getTime() > Date.now(),
+
+          featureExpiresAt: item.featureExpiresAt ?? null,
         })),
 
         pagination: {
@@ -806,9 +814,19 @@ app.get(
 
         equipment: {
           ...equipment,
+
           _id: equipment._id.toString(),
+
           descriptionHtml: cleanDescription,
+
           descriptionText: getPlainDescription(cleanDescription),
+
+          isFeatured:
+            equipment.status === "approved" &&
+            equipment.featureExpiresAt instanceof Date &&
+            equipment.featureExpiresAt.getTime() > Date.now(),
+
+          featureExpiresAt: equipment.featureExpiresAt ?? null,
         },
       });
     } catch (error) {
@@ -1452,4 +1470,3 @@ if (!process.env.VERCEL) {
     process.exitCode = 1;
   });
 }
-

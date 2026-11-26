@@ -1,18 +1,26 @@
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 
+// ======================================
+// Configuration
+// ======================================
+
 const DURATIONS = [5, 15, 30];
-const MIN_FEE_PAISA = 3000; // ৳30
-const DAY_MS = 86400000;
+const MIN_FEE_PAISA = 3000;
+const DAY_MS = 86_400_000;
 
 let stripeClient;
+
+// ======================================
+// Stripe Client
+// ======================================
 
 function stripe() {
   if (!stripeClient) {
     const key = process.env.STRIPE_SECRET_KEY?.trim();
 
     if (!key?.startsWith("sk_test_")) {
-      throw new Error("Stripe Sandbox requires STRIPE_SECRET_KEY=sk_test_...");
+      throw new Error("STRIPE_SECRET_KEY must be a Stripe test secret key.");
     }
 
     stripeClient = new Stripe(key);
@@ -21,22 +29,26 @@ function stripe() {
   return stripeClient;
 }
 
-function idCandidates(value) {
-  const values = [value];
-
-  if (/^[0-9a-f]{24}$/i.test(value)) {
-    values.push(new ObjectId(value));
-  }
-
-  return values;
-}
+// ======================================
+// Helpers
+// ======================================
 
 function validEquipmentId(id) {
   return typeof id === "string" && /^[0-9a-f]{24}$/i.test(id);
 }
 
+function idCandidates(id) {
+  const ids = [id];
+
+  if (validEquipmentId(id)) {
+    ids.push(new ObjectId(id));
+  }
+
+  return ids;
+}
+
 // ======================================
-// Server-Side Promotion Pricing
+// Promotion Pricing
 // ======================================
 
 function calculateQuote(dailyPrice, days) {
@@ -46,24 +58,23 @@ function calculateQuote(dailyPrice, days) {
     return null;
   }
 
-  // Standard rate: 1% per feature-day.
   const basePaisa = Math.round((dailyPaisa * days) / 100);
 
-  // Maximum effective rate: 2%.
   const capPaisa = Math.floor((dailyPaisa * days * 2) / 100);
 
-  // Minimum total charge: ৳30.
-  const configuredMinimumBDT = Number(process.env.STRIPE_FEATURE_MIN_BDT || 0);
+  const minimumBDT = Number(process.env.STRIPE_FEATURE_MIN_BDT || 0);
 
-  if (!Number.isFinite(configuredMinimumBDT) || configuredMinimumBDT < 0) {
+  if (!Number.isFinite(minimumBDT) || minimumBDT < 0) {
     throw new Error("Invalid STRIPE_FEATURE_MIN_BDT.");
   }
 
-  const stripeMinimumPaisa = Math.round(configuredMinimumBDT * 100);
+  const amountPaisa = Math.max(
+    MIN_FEE_PAISA,
+    basePaisa,
+    Math.round(minimumBDT * 100),
+  );
 
-  const amountPaisa = Math.max(MIN_FEE_PAISA, basePaisa, stripeMinimumPaisa);
-
-  if (!Number.isSafeInteger(amountPaisa) || amountPaisa > 99999999) {
+  if (!Number.isSafeInteger(amountPaisa) || amountPaisa > 99_999_999) {
     return null;
   }
 
@@ -71,14 +82,16 @@ function calculateQuote(dailyPrice, days) {
     days,
     amountPaisa,
     amountBDT: amountPaisa / 100,
-
     eligible: amountPaisa <= capPaisa,
-
     effectivePercent: Number(
       ((amountPaisa / (dailyPaisa * days)) * 100).toFixed(3),
     ),
   };
 }
+
+// ======================================
+// Find Owner's Approved Equipment
+// ======================================
 
 async function ownedApprovedEquipment(db, id, ownerId) {
   return db.collection("equipment").findOne(
@@ -107,12 +120,12 @@ async function ownedApprovedEquipment(db, id, ownerId) {
 }
 
 // ======================================
-// Owner Routes
+// Register Owner Routes
 // ======================================
 
 export function registerFeaturedEquipmentRoutes(
   app,
-  { getDb, verifyJWT, requireRole },
+  { getDb, getMongoClient, verifyJWT, requireRole },
 ) {
   const auth = [verifyJWT, requireRole("owner")];
 
@@ -223,13 +236,15 @@ export function registerFeaturedEquipmentRoutes(
           throw new Error("CLIENT_URL is missing.");
         }
 
+        const features = db.collection("equipmentFeatures");
+
         const featureId = new ObjectId();
         const now = new Date();
 
-        const features = db.collection("equipmentFeatures");
+        // ==================================
+        // Create Pending Purchase
+        // ==================================
 
-        // Save a price snapshot before
-        // starting Stripe Checkout.
         await features.insertOne({
           _id: featureId,
 
@@ -259,6 +274,10 @@ export function registerFeaturedEquipmentRoutes(
         let checkout;
 
         try {
+          // ==================================
+          // Create Stripe Checkout Session
+          // ==================================
+
           checkout = await stripe().checkout.sessions.create(
             {
               mode: "payment",
@@ -268,7 +287,6 @@ export function registerFeaturedEquipmentRoutes(
               metadata: {
                 kind: "equipment_feature",
                 featureId: featureId.toString(),
-
                 equipmentId: equipment._id.toString(),
               },
 
@@ -286,14 +304,13 @@ export function registerFeaturedEquipmentRoutes(
                       ),
                     },
                   },
-
                   quantity: 1,
                 },
               ],
 
               success_url:
                 `${clientURL}/dashboard/feature-equipment/${equipment._id}` +
-                "?payment=success",
+                "?payment=success&session_id={CHECKOUT_SESSION_ID}",
 
               cancel_url:
                 `${clientURL}/dashboard/feature-equipment/${equipment._id}` +
@@ -310,10 +327,15 @@ export function registerFeaturedEquipmentRoutes(
             throw new Error("Stripe Checkout URL is missing.");
           }
 
-          await features.updateOne(
+          // ==================================
+          // Store Stripe Session
+          // ==================================
+
+          const saved = await features.updateOne(
             {
               _id: featureId,
               status: "checkout_pending",
+              stripeSessionId: null,
             },
             {
               $set: {
@@ -323,53 +345,57 @@ export function registerFeaturedEquipmentRoutes(
             },
           );
 
+          if (!saved.matchedCount) {
+            const latest = await features.findOne({
+              _id: featureId,
+            });
+
+            if (
+              latest?.stripeSessionId !== checkout.id ||
+              latest?.paymentStatus !== "paid"
+            ) {
+              throw new Error("Unable to store Checkout Session.");
+            }
+          }
+
           return res.status(201).json({
             success: true,
             url: checkout.url,
             featureId: featureId.toString(),
           });
         } catch (error) {
-          console.error("FEATURE CHECKOUT FAILED:", {
-            featureId: featureId.toString(),
-            equipmentId: equipment._id.toString(),
-            durationDays: days,
-            amountPaisa: quote.amountPaisa,
+          console.error("Feature Checkout creation failed:", error);
 
-            // Did Stripe create a Session?
-            stripeSessionId: checkout?.id || null,
-
-            // Actual error information
-            type: error?.type,
-            code: error?.code,
-            statusCode: error?.statusCode,
-            message: error?.message,
-          });
-
-          const stripeMessage =
-            typeof error?.message === "string" ? error.message : "";
-
-          // Stripe may reject a payment that is
-          // below the account's minimum charge.
-          const belowMinimum =
-            error?.code === "amount_too_small" ||
-            /minimum|too small|at least|convert to/i.test(stripeMessage);
-
-          if (belowMinimum && !checkout?.id) {
-            return res.status(400).json({
-              success: false,
-              error:
-                "This promotion fee is below Stripe's minimum charge. Please select a longer duration.",
-            });
+          if (checkout?.id) {
+            try {
+              await stripe().checkout.sessions.expire(checkout.id);
+            } catch (expireError) {
+              console.error("Feature Checkout session cleanup:", expireError);
+            }
           }
+
+          await features.updateOne(
+            {
+              _id: featureId,
+              paymentStatus: "unpaid",
+              status: "checkout_pending",
+            },
+            {
+              $set: {
+                status: "checkout_failed",
+                updatedAt: new Date(),
+              },
+            },
+          );
 
           return res.status(502).json({
             success: false,
             error:
-              "Promotion payment could not be started safely. Please contact support if charged.",
+              "Promotion checkout could not be started. Contact support if charged.",
           });
         }
       } catch (error) {
-        console.error("Featured Checkout error:", error);
+        console.error("Featured checkout preparation:", error);
 
         return res.status(500).json({
           success: false,
@@ -378,12 +404,220 @@ export function registerFeaturedEquipmentRoutes(
       }
     },
   );
+
+  // ====================================
+  // GET Featured Payment Status
+  // Owner Only
+  // ====================================
+
+  // Supports:
+  // ?session_id=cs_test_...
+  //
+  // Also supports older return URLs:
+  // ?payment=success
+
+  app.get(
+    "/owner/equipment/:id/feature/payment-status",
+    ...auth,
+    async (req, res) => {
+      try {
+        const equipmentId = req.params.id;
+
+        if (!validEquipmentId(equipmentId)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid equipment ID.",
+          });
+        }
+
+        const rawSessionId = req.query.session_id;
+
+        if (
+          rawSessionId !== undefined &&
+          (typeof rawSessionId !== "string" ||
+            !/^cs_(?:test_|live_)?[A-Za-z0-9_]+$/.test(rawSessionId))
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid Checkout Session ID.",
+          });
+        }
+
+        const db = getDb();
+
+        const features = db.collection("equipmentFeatures");
+
+        const filter = {
+          equipmentId: new ObjectId(equipmentId),
+
+          ownerId: {
+            $in: idCandidates(req.authUser.id),
+          },
+        };
+
+        let feature;
+
+        // ==================================
+        // Find Purchase
+        // ==================================
+
+        if (rawSessionId) {
+          feature = await features.findOne({
+            ...filter,
+            stripeSessionId: rawSessionId,
+          });
+        } else {
+          // For old Checkout redirects,
+          // check the most recent pending
+          // feature purchase first.
+
+          feature = await features.findOne(
+            {
+              ...filter,
+              status: "checkout_pending",
+              stripeSessionId: {
+                $type: "string",
+              },
+            },
+            {
+              sort: {
+                createdAt: -1,
+              },
+            },
+          );
+
+          if (!feature) {
+            feature = await features.findOne(
+              {
+                ...filter,
+                stripeSessionId: {
+                  $type: "string",
+                },
+              },
+              {
+                sort: {
+                  createdAt: -1,
+                },
+              },
+            );
+          }
+        }
+
+        if (!feature) {
+          return res.status(404).json({
+            success: false,
+            error: "Feature purchase not found.",
+          });
+        }
+
+        // ==================================
+        // Reconcile Payment with Stripe
+        // ==================================
+
+        if (feature.paymentStatus !== "paid") {
+          const checkout = await stripe().checkout.sessions.retrieve(
+            feature.stripeSessionId,
+          );
+
+          if (
+            checkout.status === "complete" &&
+            checkout.payment_status === "paid"
+          ) {
+            // Stripe Session is retrieved
+            // using the server's secret key.
+            // Reuse the transaction-safe
+            // activation handler.
+
+            await handleFeatureCheckoutWebhook(db, getMongoClient(), {
+              type: "checkout.session.completed",
+              data: {
+                object: checkout,
+              },
+            });
+          } else if (checkout.status === "expired") {
+            await handleFeatureCheckoutWebhook(db, getMongoClient(), {
+              type: "checkout.session.expired",
+              data: {
+                object: checkout,
+              },
+            });
+          }
+
+          feature = await features.findOne({
+            _id: feature._id,
+          });
+        }
+
+        // ==================================
+        // Read Equipment Feature Expiry
+        // ==================================
+
+        const equipment = await db.collection("equipment").findOne(
+          {
+            _id: new ObjectId(equipmentId),
+
+            ownerId: {
+              $in: idCandidates(req.authUser.id),
+            },
+          },
+          {
+            projection: {
+              featureExpiresAt: 1,
+              status: 1,
+            },
+          },
+        );
+
+        if (!equipment) {
+          return res.status(404).json({
+            success: false,
+            error: "Equipment not found.",
+          });
+        }
+
+        const expiresAt = equipment.featureExpiresAt;
+
+        const isFeatured =
+          equipment.status === "approved" &&
+          expiresAt instanceof Date &&
+          expiresAt.getTime() > Date.now();
+
+        res.set("Cache-Control", "no-store");
+
+        return res.status(200).json({
+          success: true,
+
+          status: feature?.status ?? null,
+
+          paymentStatus: feature?.paymentStatus ?? null,
+
+          isFeatured,
+
+          featureExpiresAt: expiresAt ?? null,
+
+          durationDays: feature?.durationDays ?? null,
+        });
+      } catch (error) {
+        console.error("Feature payment verification failed:", error);
+
+        return res.status(500).json({
+          success: false,
+          error: "Unable to verify featured payment.",
+        });
+      }
+    },
+  );
 }
 
 // ======================================
 // Stripe Webhook Payment Handler
-// Called after Stripe signature verification
 // ======================================
+
+// Called after Stripe signature verification,
+// or after an authenticated owner status
+// endpoint retrieves a session from Stripe.
+//
+// Both paths use the same activation logic.
 
 export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
   const checkout = event.data?.object;
@@ -404,6 +638,10 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
   }
 
   const featureId = checkout.metadata.featureId;
+
+  // ====================================
+  // Validate Payment Reference
+  // ====================================
 
   if (
     !validEquipmentId(featureId) ||
@@ -432,9 +670,10 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
     throw new Error("Featured Stripe Session mismatch.");
   }
 
-  const paidEvent =
-    event.type === "checkout.session.completed" ||
-    event.type === "checkout.session.async_payment_succeeded";
+  const paidEvent = [
+    "checkout.session.completed",
+    "checkout.session.async_payment_succeeded",
+  ].includes(event.type);
 
   // ====================================
   // Activate After Verified Payment
@@ -443,6 +682,7 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
   if (paidEvent && checkout.payment_status === "paid") {
     if (
       checkout.mode !== "payment" ||
+      checkout.status !== "complete" ||
       checkout.currency !== "bdt" ||
       checkout.amount_total !== feature.totalPaisa
     ) {
@@ -451,29 +691,33 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
       );
     }
 
-    const session = mongoClient.startSession();
+    const mongoSession = mongoClient.startSession();
 
     try {
-      await session.withTransaction(
+      await mongoSession.withTransaction(
         async () => {
           const current = await features.findOne(
             {
               _id: featureObjectId,
             },
-            { session },
+            {
+              session: mongoSession,
+            },
           );
 
-          // Already processed successfully.
-          // Never activate twice.
+          // Already processed.
+          // Never activate the same payment twice.
+
           if (!current || current.paymentStatus === "paid") {
             return;
           }
 
           const now = new Date();
 
-          // Write-lock the equipment so
-          // simultaneous paid promotions
-          // extend rather than overwrite.
+          // ==================================
+          // Lock Equipment During Activation
+          // ==================================
+
           const equipment = await db.collection("equipment").findOneAndUpdate(
             {
               _id: current.equipmentId,
@@ -490,16 +734,17 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
               },
             },
             {
-              session,
+              session: mongoSession,
               returnDocument: "after",
             },
           );
 
-          // An equipment item can be
-          // rejected between Checkout
-          // creation and payment.
+          // ==================================
+          // Payment Received But Ineligible
+          // ==================================
+
           if (!equipment) {
-            await features.updateOne(
+            const result = await features.updateOne(
               {
                 _id: featureObjectId,
                 paymentStatus: "unpaid",
@@ -507,32 +752,50 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
               {
                 $set: {
                   status: "paid_review",
+
                   paymentStatus: "paid",
+
                   stripeSessionId: checkout.id,
+
                   paidAt: now,
                   updatedAt: now,
                 },
               },
-              { session },
+              {
+                session: mongoSession,
+              },
             );
+
+            if (!result.matchedCount) {
+              throw new Error("Feature payment update conflict.");
+            }
 
             return;
           }
+
+          // ==================================
+          // Calculate Feature Expiration
+          // ==================================
 
           const previousExpiry =
             equipment.featureExpiresAt instanceof Date
               ? equipment.featureExpiresAt.getTime()
               : 0;
 
-          // A second purchase extends an
-          // existing feature period.
+          // Existing promotions are extended,
+          // not overwritten.
+
           const startsAt = new Date(Math.max(now.getTime(), previousExpiry));
 
           const expiresAt = new Date(
             startsAt.getTime() + current.durationDays * DAY_MS,
           );
 
-          await features.updateOne(
+          // ==================================
+          // Update Feature Purchase
+          // ==================================
+
+          const paymentResult = await features.updateOne(
             {
               _id: featureObjectId,
               paymentStatus: "unpaid",
@@ -540,6 +803,7 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
             {
               $set: {
                 status: "active",
+
                 paymentStatus: "paid",
 
                 stripeSessionId: checkout.id,
@@ -547,36 +811,55 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
                 paidAt: now,
                 startsAt,
                 expiresAt,
+
                 updatedAt: now,
               },
             },
-            { session },
+            {
+              session: mongoSession,
+            },
           );
 
-          await db.collection("equipment").updateOne(
+          if (!paymentResult.matchedCount) {
+            throw new Error("Feature activation conflict.");
+          }
+
+          // ==================================
+          // Update Equipment Featured Expiry
+          // ==================================
+
+          const equipmentResult = await db.collection("equipment").updateOne(
             {
               _id: current.equipmentId,
             },
             {
               $set: {
                 featureExpiresAt: expiresAt,
+
                 updatedAt: now,
               },
             },
-            { session },
+            {
+              session: mongoSession,
+            },
           );
+
+          if (!equipmentResult.matchedCount) {
+            throw new Error("Equipment promotion update failed.");
+          }
         },
         {
           readConcern: {
             level: "snapshot",
           },
+
           writeConcern: {
             w: "majority",
           },
         },
       );
     } finally {
-      await session.endSession();
+      await mongoSession.endSession();
     }
 
     return true;
@@ -593,7 +876,9 @@ export async function handleFeatureCheckoutWebhook(db, mongoClient, event) {
     await features.updateOne(
       {
         _id: featureObjectId,
+
         paymentStatus: "unpaid",
+
         status: "checkout_pending",
       },
       {
